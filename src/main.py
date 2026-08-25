@@ -19,8 +19,8 @@ def ejecutar_simulacion():
         close_engine()
 
     num_escenarios = 1
-    start_seed = 37
-    VIDEO_SKIP = 5
+    start_seed = 47
+    VIDEO_SKIP = 7
 
     env = MetaDriveEnv(dict(
         use_render=False,
@@ -95,11 +95,15 @@ def ejecutar_simulacion():
                         if dist_obs < dist_critica:
                             freno_emergencia = True
                     
-                    # Resolver siempre el MPC para obtener el guiñado ideal
-                    u_nom_seq, u0_warm_flat = mpc.solve(u0_warm, state_real, ref_trajectory, obstacle_pos=obstacle_pos)
+                    # Resolver MPC con CBF activa
+                    u_nom_seq, u0_warm_flat = mpc.solve(
+                        u0_warm, 
+                        state_real, 
+                        ref_trajectory, 
+                        obstacle_pos=obstacle_pos
+                    )
 
                     if freno_emergencia:
-                        # Mantener el ángulo de dirección del MPC (u_nom_seq[0, 0]) y aplicar freno máximo (-1.0)
                         u_nom_first = np.array([u_nom_seq[0, 0], -1.0])
                     else:
                         u_nom_first = u_nom_seq[0]
@@ -110,24 +114,58 @@ def ejecutar_simulacion():
                 obs, reward, terminated, truncated, info = env.step(u_nom_first)
                 pasos_completados += 1
 
-                # === CAPTURA DE VIDEO ===
+                # === CAPTURA Y ANOTACIÓN DE VIDEO ===
                 if step % VIDEO_SKIP == 0:
+                    screen_w, screen_h = 600, 600
+                    scaling = 5  # píxeles por metro
+
                     frame = env.render(
                         mode="topdown",
                         window=False,
-                        screen_size=(600, 600),
+                        screen_size=(screen_w, screen_h),
                         camera_position=vehicle.position,
                         target_vehicle_heading_up=True,
-                        scaling=5,
+                        scaling=scaling,
                         text={
                             "seed": seed,
                             "step": step,
                             "speed_kmh": round(state_real[2] * 3.6, 1)
                         }
                     )
+
+                    # Dibujar círculos de barrera si se detecta un obstáculo
+                    if obstacle_pos is not None:
+                        v_curr = max(state_real[2], 0.0)
+                        r_cbf_m = 10.0 + 0.8 * v_curr      # Margen preventivo CBF
+                        r_aeb_m = 5.0 + 0.8 * v_curr       # Margen crítico AEB
+
+                        # Transformar posición del obstáculo a píxeles de la cámara
+                        rel_pos = obstacle_pos - state_real[:2]
+                        theta = state_real[3]
+
+                        # Proyección en ejes local del vehículo (arriba/derecha)
+                        d_fwd = rel_pos[0] * np.cos(theta) + rel_pos[1] * np.sin(theta)
+                        d_right = rel_pos[0] * np.sin(theta) - rel_pos[1] * np.cos(theta)
+
+                        center_x = int(screen_w / 2 + d_right * scaling)
+                        center_y = int(screen_h / 2 - d_fwd * scaling)
+
+                        r_cbf_px = int(r_cbf_m * scaling)
+                        r_aeb_px = int(r_aeb_m * scaling)
+
+                        # Formato de color RGB para imageio
+                        # Círculo Exterior (CBF Preventivo): Amarillo (255, 255, 0)
+                        cv2.circle(frame, (center_x, center_y), r_cbf_px, (255, 255, 0), 2)
+                        
+                        # Círculo Interior (AEB Freno Crítico): Rojo (255, 0, 0)
+                        cv2.circle(frame, (center_x, center_y), r_aeb_px, (255, 0, 0), 2)
+
                     writer.append_data(frame)
 
-                # Registro de desviación sin romper el bucle
+                    if step % int(5 * VIDEO_SKIP) == 0:
+                        print(f"{step} / 2000 -- VELOCIDAD: {max(state_real[2], 0.0):.2f} m/s")
+
+                # Registro de desviación
                 ancho_carril = lane.width
                 limite_borde = ancho_carril / 2.0
 
@@ -160,11 +198,6 @@ def ejecutar_simulacion():
             for r in resultados:
                 print(f"{r['Seed']:<8} | {r['Éxito']:<6} | {r['Err. Lat. Promedio (m)']:<17.3f} | {r['Err. Lat. Máximo (m)']:<16.3f} | {r['Exceso Salida (m)']:<18.3f} | {r['Pasos']:<6}")
             print("=" * 92)
-
-            tasa_exito = (sum(1 for r in resultados if r['Éxito'] == 'SÍ') / len(resultados)) * 100
-            err_prom_global = np.mean([r['Err. Lat. Promedio (m)'] for r in resultados])
-            print(f"Tasa de Éxito Global: {tasa_exito:.1f}%")
-            print(f"Error Lateral Promedio Global: {err_prom_global:.3f} m\n")
 
 
 if __name__ == "__main__":
