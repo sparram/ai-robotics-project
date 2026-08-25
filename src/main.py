@@ -6,25 +6,21 @@ import imageio
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["CVXPY_ACTIVE_SOLVER"] = "CLARABEL"
 
-from config import N, DT, TOTAL_STEPS, FPS, MPC_SKIP_STEPS, TOLERANCIA_MAX_M, VIDEO_FILENAME
-from controllers.nominal_mpc import NominalMPC
+from config import N, DT, TOTAL_STEPS, FPS, MPC_SKIP_STEPS, VIDEO_FILENAME
+from controllers.mpc_cbf_controller import MPC_CBF
 from controllers.rl_controller import RLController
 from metadrive.envs.metadrive_env import MetaDriveEnv
 from metadrive.engine.engine_utils import close_engine, engine_initialized
 
-
-def ejecutar_simulacion(tipo_controlador="MPC"):
-    """
-    Soporta tipo_controlador: 'MPC' o 'RL'
-    """
+# EJECUTAR SIMULACIÓN
+def run(control_type="MPC-CBF"):
     if engine_initialized():
         close_engine()
 
     num_escenarios = 1
-    start_seed = 47
-    VIDEO_SKIP = 7
+    start_seed = 37
+    VIDEO_SKIP = 5
 
     env = MetaDriveEnv(dict(
         use_render=False,
@@ -36,18 +32,19 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
         out_of_road_done=False
     ))
 
-    # Selección dinámica del controlador
-    if tipo_controlador == "MPC":
-        mpc = NominalMPC(horizon=N)
-    elif tipo_controlador == "RL":
+    # Seleccionar controlador a utilizar
+    if control_type == "MPC-CBF":
+        mpc_cbf = MPC_CBF(horizon=N)
+    elif control_type == "RL":
         rl_agent = RLController("models_checkpoints/ppo_metadrive.zip")
     else:
-        raise ValueError(f"Controlador desconocido: {tipo_controlador}")
+        raise ValueError(f"Error: Selecciona un controlador válido: MPC-CBF o RL")
 
     writer = imageio.get_writer(VIDEO_FILENAME, fps=FPS)
     resultados = []
 
     try:
+        # EJECUTAR TODOS LOS ESCENARIOS
         for seed in range(start_seed, start_seed + num_escenarios):
             obs, info = env.reset(seed=seed)
             u0_warm = np.zeros(N * 2)
@@ -58,6 +55,7 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
             pasos_completados = 0
             exceso_salida = 0.0
 
+            # EJECUTAR LOS PASOS DE LA SIMULACIÓN
             for step in range(TOTAL_STEPS):
                 vehicle = env.agent
                 state_real = np.array([
@@ -71,21 +69,20 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                 current_s, lat_error = lane.local_coordinates((state_real[0], state_real[1]))
                 errores_laterales.append(abs(lat_error))
 
-                # === CÁLCULO DE LA ACCIÓN DE CONTROL ===
-                if tipo_controlador == "RL":
-                    u_nom_first = rl_agent.solve(obs)
+                # CODIGO DE CONTROL
+                # CONTROL Rl:
+                if control_type == "RL":
+                    u_nom_first = rl_agent.solve(obs) # Llama el modelo RL
 
                     obstacle_pos = None
                     v_curr = max(state_real[2], 0.0)  # Velocidad actual en m/s
                 
-                    # === 1. REGULADOR DE VELOCIDAD PARA ROTONDA ===
-                    # Las curvas de "O" requieren máximo 20-22 km/h (6 m/s) para no perder tracción
+                    # Limitador de velocidad en rotondas (Precaución)
                     v_max_rotonda = 4.0
                     if v_curr > v_max_rotonda:
-                        # Suprime la aceleración desmedida del RL y aplica desaceleración suave
-                        u_nom_first[1] = min(u_nom_first[1], -0.3)
+                        u_nom_first[1] = min(u_nom_first[1], -0.3) # Desacelerar en caso de superar la v_max
                 
-                    # === 2. ESCUDO DE COLISIÓN EN CARRIEL ===
+                    # MECANISMO AEB : FRENADO DE PRECAUCIÓN
                     vehicles = env.engine.traffic_manager.vehicles
                     theta = state_real[3]
                     dist_critica = 10.0 + 0.5 * v_curr  # Distancia de frenado dinámica
@@ -94,16 +91,16 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                         if v != vehicle:
                             rel_pos = v.position - vehicle.position
                             
-                            # Proyección longitudinal y lateral
+                            # Proyección longitudinal y lateral de distancias al obstaculo
                             d_fwd = rel_pos[0] * np.cos(theta) + rel_pos[1] * np.sin(theta)
                             d_right = rel_pos[0] * np.sin(theta) - rel_pos[1] * np.cos(theta)
                 
-                            # En rotondas el carril es más estrecho en proyección: |d_right| < 1.5 m
                             # CASO A: Peligro inminente -> Freno total (-1.0)
                             if 0 < d_fwd < dist_critica and abs(d_right) < 1.5:
                                 u_nom_first[1] = -1.0
                                 obstacle_pos = np.array([v.position[0], v.position[1]])  # Para el dibujo visual
                                 break
+                
                             # CASO B: Reanudación / Distancia media (5 a 10 metros) -> Aceleración limitada
                             elif 0 < d_fwd < 10.0 and abs(d_right) < 1.5:
                                 u_nom_first[1] = min(u_nom_first[1], 0.05)  # Avanzar muy despacio
@@ -111,9 +108,10 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                                 break
                             else:
                                 pass
-                                
-                elif tipo_controlador == "MPC":
+                # CONTROL MPC-CBF
+                elif control_type == "MPC-CBF":
                     if step % MPC_SKIP_STEPS == 0:
+                        # OBTENER TRAYECTORIA DE REFERENCIA
                         ref_trajectory = []
                         target_speed = 8.0
                         for i in range(N):
@@ -137,7 +135,7 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                                     min_dist = dist_adelante
                                     obstacle_pos = np.array([v.position[0], v.position[1]])
                         
-                        # Evaluación del freno de emergencia
+                        # Evaluación del freno de emergencia AEB
                         freno_emergencia = False
                         if obstacle_pos is not None:
                             dist_obs = np.linalg.norm(state_real[:2] - obstacle_pos)
@@ -148,7 +146,7 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                                 freno_emergencia = True
                         
                         # Resolver MPC con CBF activa
-                        u_nom_seq, u0_warm_flat = mpc.solve(
+                        u_nom_seq, u0_warm_flat = mpc_cbf.solve(
                             u0_warm, 
                             state_real, 
                             ref_trajectory, 
@@ -159,7 +157,8 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                             u_nom_first = np.array([u_nom_seq[0, 0], -1.0])
                         else:
                             u_nom_first = u_nom_seq[0]
-                        
+
+                        # Actualizar el u0 base para la siguiente optimización
                         u0_warm = np.roll(u0_warm_flat, -2)
                         u0_warm[-2:] = u0_warm[-4:-2]
 
@@ -167,7 +166,8 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                 obs, reward, terminated, truncated, info = env.step(u_nom_first)
                 pasos_completados += 1
 
-                # === CAPTURA Y ANOTACIÓN DE VIDEO ===
+                # PARTE DE VISUALIZACIÓN
+                # CREACIÓN DEL VIDEO
                 if step % VIDEO_SKIP == 0:
                     screen_w, screen_h = 608, 608
                     scaling = 5  # píxeles por metro
@@ -183,12 +183,12 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                             "seed": seed,
                             "step": step,
                             "speed_kmh": round(state_real[2] * 3.6, 1),
-                            "mode": tipo_controlador
+                            "mode": control_type
                         }
                     )
 
                     # Dibujar círculos si hay obstáculo detectado
-                    if tipo_controlador == "MPC" and obstacle_pos is not None:
+                    if control_type == "MPC-CBF" and obstacle_pos is not None:
                         v_curr = max(state_real[2], 0.0)
                         r_cbf_m = 2.5 + 0.3 * v_curr
                         r_aeb_m = 10.0 + 0.8 * v_curr
@@ -208,7 +208,7 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                         cv2.circle(frame, (center_x, center_y), r_cbf_px, (255, 255, 0), 2)
                         cv2.circle(frame, (center_x, center_y), r_aeb_px, (255, 0, 0), 2)
                         
-                    elif tipo_controlador == "RL" and obstacle_pos is not None:
+                    elif control_type == "RL" and obstacle_pos is not None:
                         v_curr = max(state_real[2], 0.0)
                         r_aeb_m = 6.0 + 0.6 * v_curr  # Radio dinámico del AEB
                     
@@ -231,9 +231,9 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                     writer.append_data(frame)
 
                     if step % int(5 * VIDEO_SKIP) == 0:
-                        print(f"[{tipo_controlador}] Paso {step} / {TOTAL_STEPS} -- VELOCIDAD: {max(state_real[2], 0.0):.2f} m/s")
+                        print(f"[{control_type}] Paso {step} / {TOTAL_STEPS} -- VELOCIDAD: {max(state_real[2], 0.0):.2f} m/s")
 
-                # Registro de desviación
+                # Guardar las desviaciones y salidas del carril
                 ancho_carril = lane.width
                 limite_borde = ancho_carril / 2.0
 
@@ -245,8 +245,9 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
                         exito = True
                     break
 
+            # Guardar resultados
             resultados.append({
-                "Controlador": tipo_controlador,
+                "Controlador": control_type,
                 "Seed": seed,
                 "Éxito": "SÍ" if exito else "NO",
                 "Err. Lat. Promedio (m)": np.mean(errores_laterales) if errores_laterales else 0.0,
@@ -260,6 +261,7 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
         cv2.destroyAllWindows()
         env.close()
 
+        # Imprimir resultados
         if resultados:
             print("\n" + "=" * 98)
             print(f"{'MODO':<6} | {'SEMILLA':<8} | {'ÉXITO':<6} | {'ERR LAT PROM (m)':<17} | {'ERR LAT MÁX (m)':<16} | {'EXCESO SALIDA (m)':<18} | {'PASOS':<6}")
@@ -270,5 +272,4 @@ def ejecutar_simulacion(tipo_controlador="MPC"):
 
 
 if __name__ == "__main__":
-    # Cambia a "RL" o "MPC" según el experimento que quieras ejecutar
-    ejecutar_simulacion(tipo_controlador="RL")
+    run(control_type="MPC-CBF") # control_type: MPC-CBF o RL
