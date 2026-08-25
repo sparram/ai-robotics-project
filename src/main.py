@@ -90,7 +90,7 @@ def ejecutar_simulacion():
                     if obstacle_pos is not None:
                         dist_obs = np.linalg.norm(state_real[:2] - obstacle_pos)
                         v_curr = max(state_real[2], 0.0)
-                        dist_critica = 5.0 + 0.8 * v_curr
+                        dist_critica = 10.0 + 0.8 * v_curr
                     
                         if dist_obs < dist_critica:
                             freno_emergencia = True
@@ -136,8 +136,8 @@ def ejecutar_simulacion():
                     # Dibujar círculos de barrera si se detecta un obstáculo
                     if obstacle_pos is not None:
                         v_curr = max(state_real[2], 0.0)
-                        r_cbf_m = 10.0 + 0.8 * v_curr      # Margen preventivo CBF
-                        r_aeb_m = 5.0 + 0.8 * v_curr       # Margen crítico AEB
+                        r_cbf_m = 2.5 + 0.3 * v_curr      # Margen preventivo CBF
+                        r_aeb_m = 10.0 + 0.8 * v_curr       # Margen crítico AEB
 
                         # Transformar posición del obstáculo a píxeles de la cámara
                         rel_pos = obstacle_pos - state_real[:2]

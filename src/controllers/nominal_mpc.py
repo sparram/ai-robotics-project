@@ -22,7 +22,7 @@ class NominalMPC:
 
         return x_bar, A_seq, B_seq
 
-    def _cbf_constraint_multistep(self, u_flat, current_state, obstacle_pos, gamma=0.4):
+    def _cbf_constraint_multistep(self, u_flat, current_state, obstacle_pos, gamma=0.9):
         """
         Aplica la condicion CBF h(x_{k+1}) - (1 - gamma)*h(x_k) >= 0 
         a lo largo de todo el horizonte N.
@@ -32,7 +32,7 @@ class NominalMPC:
         
         # Margen dinamico adaptado a la velocidad actual
         v_current = max(current_state[2], 1.0)
-        R_margin = 10.0 + 0.8 * v_current  
+        R_margin = 2.5 + 0.3 * v_current  
 
         cbf_violations = []
         x_curr = current_state.copy()
