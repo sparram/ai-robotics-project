@@ -1,0 +1,7 @@
+imageio==2.37.4
+metadrive_simulator==0.4.3
+numpy==2.5.2
+opencv_python==5.0.0.93
+scipy==1.18.1
+stable_baselines3==2.9.0
+torch==2.13.0
