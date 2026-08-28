@@ -7,12 +7,14 @@ class MPC_CBF:
     def __init__(self, horizon=N):
         self.N = horizon
 
-    # PREDICE LA TRAYECTORIA DEL VEHICULO EN LOS SIGUIENTES N PASOS
     def _predict_trajectory(self, current_state, u_seq):
+        """
+        Predice la trayectoria nominal (x_bar) y extrae las matrices Jacobianas LTV (A, B)
+        a lo largo del horizonte N.
+        """
         x_bar = np.zeros((self.N + 1, 4))
         x_bar[0] = current_state
-        A_seq = []
-        B_seq = []
+        A_seq, B_seq = [], []
 
         for i in range(self.N):
             A = KinematicBicycleModel.jacobian_x(x_bar[i], u_seq[i])
@@ -23,42 +25,43 @@ class MPC_CBF:
 
         return x_bar, A_seq, B_seq
 
-    # AGREGA LA RESTRICCION CBF PARA TODO EL HORIZONTE DE N PASOS
-    # Añade las restricciones h(x_{k+1}) - (1 - gamma)*h(x_k) >= 0 a la optimización
     def _cbf_constraint_multistep(self, u_flat, current_state, obstacle_pos, gamma=GAMMA_CBF):
+        """
+        Aplica la restricción CBF en tiempo discreto: h(x_{k+1}) - (1 - gamma) * h(x_k) >= 0.
+        Se activa únicamente cuando existe un obstáculo detectado.
+        """
+        if obstacle_pos is None:
+            return np.array([0.0])
+
         u = u_flat.reshape((self.N, 2))
         x_obs, y_obs = obstacle_pos[0], obstacle_pos[1]
         
-        # Margen adaptativo según la velocidad actual
-        v_current = max(current_state[2], 1.0)
-        R_margin = 2.5 + 0.3 * v_current  
-
         cbf_violations = []
         x_curr = current_state.copy()
 
         for k in range(self.N):
             x_next = KinematicBicycleModel.step(x_curr, u[k])
 
-            # Función h(x_k)
+            v_k = max(x_curr[2], 0.1)
+            R_margin = 2.5 + 0.3 * v_k
+
             h_curr = (x_curr[0] - x_obs)**2 + (x_curr[1] - y_obs)**2 - R_margin**2
             h_next = (x_next[0] - x_obs)**2 + (x_next[1] - y_obs)**2 - R_margin**2
             
-            # Condicion CBF discreta: h(x_{k+1}) - (1 - gamma)*h(x_k) >= 0
             cbf_violations.append((h_next - h_curr) + gamma * h_curr)
-            
             x_curr = x_next
 
         return np.array(cbf_violations)
 
-    # DEFINE LA FUNCIÓN DE COSTO DEL MPC
-    # El costo es una combinación convexa de:
-    # Penalización por posición respecto a una trayectoria de referencia
-    # Penalización por velocidad respecto a una velocidad de referencia
-    # Penalización por cambios bruscos en el control (tanto aceleración como steer)
     def _cost_function(self, u_flat, current_state, reference_trajectory, u_warm):
+        """
+        Calcula la función de costo proyectando las desviaciones lineales:
+        \delta x_{k+1} = A_k \delta x_k + B_k \delta u_k
+        """
         u = u_flat.reshape((self.N, 2))
         cost = 0.0
 
+        # Obtención de la trayectoria nominal y jacobianos en el punto de operación u_warm
         x_bar, A_seq, B_seq = self._predict_trajectory(current_state, u_warm)
         delta_x = np.zeros(4)
 
@@ -69,6 +72,7 @@ class MPC_CBF:
 
             ref_x, ref_y, ref_v = reference_trajectory[i]
 
+            # Términos de error cuadrático
             cost_pos = ((state_pred[0] - ref_x) ** 2 + (state_pred[1] - ref_y) ** 2) / (2.0 ** 2)
             cost_spd = (state_pred[2] - ref_v) ** 2 / (5.0 ** 2)
             cost_ctrl = (u[i, 0] ** 2) / (0.5 ** 2) + (u[i, 1] ** 2) / (1.0 ** 2)
@@ -81,8 +85,6 @@ class MPC_CBF:
 
         return cost
 
-    # RESUELVE EL PROBLEMA DE OPTIMIZACIÓN
-    # Retorna la acción óptima a tomar en el siguiente estado
     def solve(self, u0_warm, current_state, reference_trajectory, obstacle_pos=None):
         u_warm = u0_warm.reshape((self.N, 2))
         bounds = [(-1.0, 1.0)] * (self.N * 2)
@@ -108,7 +110,4 @@ class MPC_CBF:
         if res.success:
             return res.x.reshape((self.N, 2)), res.x
         
-        # Si falla la optimización, aplicar frenado de emergencia en vez de seguir u_warm
-        u_brake = u_warm.copy()
-        u_brake[:, 1] = -1.0  # Deceleracion maxima
-        return u_brake, u_brake.flatten()
+        return u_warm, u0_warm.flatten()
