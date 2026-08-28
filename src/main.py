@@ -95,13 +95,12 @@ def run(control_type="MPC-CBF"):
                                 break
 
                 # -------------------------------------------------------------
-                # MODO MPC-CBF
+                # MODO MPC-CBF MULTI-OBSTÁCULO
                 # -------------------------------------------------------------
                 elif control_type == "MPC-CBF":
                     if step % MPC_SKIP_STEPS == 0:
                         ref_trajectory = []
                         
-                        # 1. Velocidad adaptativa: reducir a 5.0 m/s si estamos en curva/rotonda
                         is_curved = abs(lane.heading_theta_at(current_s + 5) - lane.heading_theta_at(current_s)) > 0.1
                         target_speed = 5.0 if is_curved else 8.0
                 
@@ -110,42 +109,23 @@ def run(control_type="MPC-CBF"):
                             ref_x, ref_y = lane.position(target_s, 0)
                             ref_trajectory.append((ref_x, ref_y, target_speed))
                 
-                        # 2. Detección de obstáculos en Coordenadas Frenet (s, d)
-                        obstacle_pos = None
-                        min_delta_s = 20.0  # Rango máximo de búsqueda longitudinal
-                
+                        # Recolectar TODOS los obstáculos en un radio de 18 metros
+                        obstacles_list = []
                         vehicles = env.engine.traffic_manager.vehicles
                         for v in vehicles:
                             if v != vehicle:
-                                # Proyectar obstáculo al carril del ego
-                                s_obs, d_obs = lane.local_coordinates(v.position)
-                                delta_s = s_obs - current_s
-                
-                                # Evaluar si está adelante (delta_s > 0) y en nuestro carril (|d_obs| < 1.8m)
-                                if 0 < delta_s < min_delta_s and abs(d_obs) < 1.8:
-                                    min_delta_s = delta_s
-                                    obstacle_pos = np.array([v.position[0], v.position[1]])
-                
-                        # 3. Frenado de emergencia si la distancia longitudinal en carril es crítica
-                        freno_emergencia = False
-                        if obstacle_pos is not None:
-                            v_curr = max(state_real[2], 0.0)
-                            dist_critica_aeb = 3.0 + 0.15 * v_curr
-                            if min_delta_s < dist_critica_aeb:
-                                freno_emergencia = True
+                                dist = np.linalg.norm(v.position - vehicle.position)
+                                if dist < 18.0:
+                                    obstacles_list.append(np.array([v.position[0], v.position[1]]))
                 
                         u_nom_seq, u0_warm_flat = mpc_cbf.solve(
                             u0_warm,
                             state_real,
                             ref_trajectory,
-                            obstacle_pos=obstacle_pos
+                            obstacles_list=obstacles_list
                         )
                 
-                        if freno_emergencia:
-                            u_nom_first = np.array([u_nom_seq[0, 0], -1.0])
-                        else:
-                            u_nom_first = u_nom_seq[0]
-                
+                        u_nom_first = u_nom_seq[0]
                         u0_warm = np.roll(u0_warm_flat, -2)
                         u0_warm[-2:] = u0_warm[-4:-2]
 
@@ -154,85 +134,61 @@ def run(control_type="MPC-CBF"):
                 pasos_completados += 1
 
                 # -------------------------------------------------------------
-                # RENDERIZADO Y VISUALIZACIÓN DE CONTROL Y BARRERAS
+                # RENDERIZADO Y VISUALIZACIÓN MULTI-OBSTÁCULO (CV2)
                 # -------------------------------------------------------------
                 if step % VIDEO_SKIP == 0:
                     screen_w, screen_h = 608, 608
                     scaling = 5
-
+                
                     frame = env.render(
                         mode="topdown",
                         window=False,
                         screen_size=(screen_w, screen_h),
                         camera_position=vehicle.position,
-                        target_vehicle_heading_up=True,
+                        target_agent_heading_up=True,
                         scaling=scaling,
                         text={
                             "seed": seed,
                             "step": step,
                             "speed_kmh": round(state_real[2] * 3.6, 1),
                             "mode": control_type,
+                            "obs_count": len(obstacles_list) if control_type == "MPC-CBF" else 0,
                             "steer": round(u_nom_first[0], 2),
                             "accel": round(u_nom_first[1], 2)
                         }
                     )
-
+                
                     car_cx, car_cy = screen_w // 2, screen_h // 2
-
-                    # 1. DIBUJAR FLECHA DE CONTROL (VECTOR U)
+                
+                    # 1. Flecha de vector de control
                     u_steer, u_acc = u_nom_first[0], u_nom_first[1]
-                    scale_vec = 45.0  # Escala visual en píxeles
-
-                    # En vista Top-Down con vehículo orientado hacia ARRIBA:
-                    # - Aceleración positiva = sube en la imagen (-Y)
-                    # - Giro positivo (izquierda) = izquierda en la imagen (-X)
+                    scale_vec = 45.0
                     end_x = int(car_cx - u_steer * scale_vec)
                     end_y = int(car_cy - u_acc * scale_vec)
-
-                    # Color: Verde si acelera, Rojo si frena
                     color_vector = (0, 255, 0) if u_acc >= 0 else (0, 0, 255)
-
-                    # Dibujar vector desde el centro del vehículo
-                    cv2.arrowedLine(
-                        frame,
-                        (car_cx, car_cy),
-                        (end_x, end_y),
-                        color_vector,
-                        3,
-                        tipLength=0.35
-                    )
-
-                    # Leyenda en pantalla para la flecha
-                    cv2.putText(
-                        frame,
-                        f"Control Vector (u_steer: {u_steer:.2f}, u_acc: {u_acc:.2f})",
-                        (20, screen_h - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (255, 255, 255),
-                        1,
-                        cv2.LINE_AA
-                    )
-
-                    # 2. DIBUJAR ANILLOS DE SEGURIDAD (CBF y AEB)
-                    if control_type == "MPC-CBF" and obstacle_pos is not None:
+                
+                    cv2.arrowedLine(frame, (car_cx, car_cy), (end_x, end_y), color_vector, 3, tipLength=0.35)
+                
+                    # 2. Anillos de seguridad CBF para CADA obstáculo cercano
+                    if control_type == "MPC-CBF" and obstacles_list:
                         v_curr = max(state_real[2], 0.0)
                         r_cbf_m = 2.5 + 0.3 * v_curr
-                        r_aeb_m = 2.0 + 0.1 * v_curr
-
-                        rel_pos = obstacle_pos - state_real[:2]
                         theta = state_real[3]
-
-                        d_fwd = rel_pos[0] * np.cos(theta) + rel_pos[1] * np.sin(theta)
-                        d_right = rel_pos[0] * np.sin(theta) - rel_pos[1] * np.cos(theta)
-
-                        center_x = int(screen_w / 2 + d_right * scaling)
-                        center_y = int(screen_h / 2 - d_fwd * scaling)
-
-                        # Amarillo: Límite CBF | Rojo: Límite AEB
-                        cv2.circle(frame, (center_x, center_y), int(r_cbf_m * scaling), (255, 255, 0), 2)
-                        cv2.circle(frame, (center_x, center_y), int(r_aeb_m * scaling), (255, 0, 0), 2)
-
+                
+                        for obs_pos in obstacles_list:
+                            rel_pos = obs_pos - state_real[:2]
+                
+                            # Transformación al sistema local del Ego (Heading-Up)
+                            d_fwd = rel_pos[0] * np.cos(theta) + rel_pos[1] * np.sin(theta)
+                            d_right = rel_pos[0] * np.sin(theta) - rel_pos[1] * np.cos(theta)
+                
+                            # Conversión a píxeles de pantalla
+                            center_x = int(screen_w / 2 + d_right * scaling)
+                            center_y = int(screen_h / 2 - d_fwd * scaling)
+                
+                            # Dibujar barrera CBF en amarillo para cada vehículo
+                            cv2.circle(frame, (center_x, center_y), int(r_cbf_m * scaling), (255, 255, 0), 2)
+                
                     writer.append_data(frame)
 
                 # Métricas de salida de carril

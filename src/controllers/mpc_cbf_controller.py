@@ -30,7 +30,7 @@ class MPC_CBF:
 
         return x_bar, A_seq, B_seq
 
-    def solve(self, u0_warm, current_state, reference_trajectory, obstacle_pos=None):
+    def solve(self, u0_warm, current_state, reference_trajectory, obstacles_list=None):
         u_warm = u0_warm.reshape((self.N, 2))
         x_bar, A_seq, B_seq = self._predict_trajectory(current_state, u_warm)
 
@@ -46,7 +46,7 @@ class MPC_CBF:
                         A_prod = A_seq[m] @ A_prod
                     S_u[4*k:4*(k+1), 2*j:2*(j+1)] = A_prod @ B_seq[j]
 
-        # 2. Matrices Q y R (sin penalización en theta)
+        # 2. Matrices Q y R
         Q_block = np.diag([self.w_pos, self.w_pos, self.w_spd, 0.0])
         Q = sparse.kron(sparse.eye(self.N), Q_block)
 
@@ -69,12 +69,12 @@ class MPC_CBF:
             E[4*i + 1] = x_bar[i + 1, 1] - ref_y
             E[4*i + 2] = x_bar[i + 1, 2] - ref_v
 
-        # 4. Formulación de Hessiana P y gradiente q
+        # 4. Hessiana P y gradiente q
         P_dense = S_u.T @ Q @ S_u + R.toarray() + D_diff.T @ R_d @ D_diff
         P = sparse.csc_matrix(P_dense)
         q = S_u.T @ Q @ E - D_diff.T @ R_d @ D_diff @ u_warm.flatten()
 
-        # 5. Límites físicos de control (-1.0 <= u <= 1.0)
+        # 5. Límites físicos (-1.0 <= u <= 1.0)
         A_bounds = sparse.eye(2 * self.N, format='csc')
         l_bounds = -np.ones(2 * self.N)
         u_bounds = np.ones(2 * self.N)
@@ -83,27 +83,32 @@ class MPC_CBF:
         l_list = [l_bounds]
         u_list = [u_bounds]
 
-        # 6. Restricción CBF
-        if obstacle_pos is not None:
-            x_obs, y_obs = obstacle_pos[0], obstacle_pos[1]
-            A_cbf = np.zeros((self.N, 2 * self.N))
-            l_cbf = np.zeros(self.N)
-            u_cbf = np.full(self.N, np.inf)
+        # 6. RESTRICCIONES MULTI-CBF (M obstáculos x N pasos del horizonte)
+        if obstacles_list is not None and len(obstacles_list) > 0:
+            M = len(obstacles_list)
+            A_cbf = np.zeros((M * self.N, 2 * self.N))
+            l_cbf = np.zeros(M * self.N)
+            u_cbf = np.full(M * self.N, np.inf)
 
-            x_curr = current_state.copy()
-            for k in range(self.N):
-                v_k = max(x_curr[2], 0.1)
-                R_margin = 2.5 + 0.3 * v_k
+            row_idx = 0
+            for obs_pos in obstacles_list:
+                x_obs, y_obs = obs_pos[0], obs_pos[1]
+                x_curr = current_state.copy()
 
-                dh_dx = 2 * (x_curr[0] - x_obs)
-                dh_dy = 2 * (x_curr[1] - y_obs)
-                grad_h = np.array([dh_dx, dh_dy, 0.0, 0.0])
+                for k in range(self.N):
+                    v_k = max(x_curr[2], 0.1)
+                    R_margin = 2.5 + 0.3 * v_k
 
-                A_cbf[k, :] = grad_h @ S_u[4*k:4*(k+1), :]
-                h_curr = (x_curr[0] - x_obs)**2 + (x_curr[1] - y_obs)**2 - R_margin**2
-                l_cbf[k] = -GAMMA_CBF * h_curr
+                    dh_dx = 2 * (x_curr[0] - x_obs)
+                    dh_dy = 2 * (x_curr[1] - y_obs)
+                    grad_h = np.array([dh_dx, dh_dy, 0.0, 0.0])
 
-                x_curr = KinematicBicycleModel.step(x_curr, u_warm[k])
+                    A_cbf[row_idx, :] = grad_h @ S_u[4*k:4*(k+1), :]
+                    h_curr = (x_curr[0] - x_obs)**2 + (x_curr[1] - y_obs)**2 - R_margin**2
+                    l_cbf[row_idx] = -GAMMA_CBF * h_curr
+
+                    row_idx += 1
+                    x_curr = KinematicBicycleModel.step(x_curr, u_warm[k])
 
             A_list.append(sparse.csc_matrix(A_cbf))
             l_list.append(l_cbf)
@@ -122,6 +127,7 @@ class MPC_CBF:
             u_opt = res.x.reshape((self.N, 2))
             return u_opt, res.x
 
+        # Si el problema es infactible (ej. encerrado por autos), frena
         u_brake = u_warm.copy()
         u_brake[:, 1] = -1.0
         return u_brake, u_brake.flatten()
