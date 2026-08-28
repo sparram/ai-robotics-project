@@ -27,8 +27,8 @@ def run(control_type="MPC-CBF"):
         use_render=False,
         num_scenarios=num_escenarios,
         start_seed=start_seed,
-        traffic_density=0.15,  # <-- Tráfico activo
-        map="OCCO",
+        traffic_density=0.2,  # <-- Tráfico activo
+        map="CCCCC",
         crash_object_done=False,
         out_of_road_done=False
     ))
