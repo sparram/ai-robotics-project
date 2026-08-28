@@ -1,5 +1,6 @@
 import numpy as np
-from scipy.optimize import minimize
+import osqp
+from scipy import sparse
 from config import N, DT, GAMMA_CBF
 from models.kinematic import KinematicBicycleModel
 
@@ -7,11 +8,15 @@ class MPC_CBF:
     def __init__(self, horizon=N):
         self.N = horizon
 
+        # Pesos cuadráticos normalizados
+        self.w_pos = 0.60 / (2.0 ** 2)
+        self.w_spd = 0.20 / (5.0 ** 2)
+        self.w_ctrl_steer = 0.20 / (0.5 ** 2)
+        self.w_ctrl_acc = 0.20 / (1.0 ** 2)
+        self.w_dctrl_steer = 0.20 / (0.1 ** 2)
+        self.w_dctrl_acc = 0.20 / (2.0 ** 2)
+
     def _predict_trajectory(self, current_state, u_seq):
-        """
-        Predice la trayectoria nominal (x_bar) y extrae las matrices Jacobianas LTV (A, B)
-        a lo largo del horizonte N.
-        """
         x_bar = np.zeros((self.N + 1, 4))
         x_bar[0] = current_state
         A_seq, B_seq = [], []
@@ -25,89 +30,98 @@ class MPC_CBF:
 
         return x_bar, A_seq, B_seq
 
-    def _cbf_constraint_multistep(self, u_flat, current_state, obstacle_pos, gamma=GAMMA_CBF):
-        """
-        Aplica la restricción CBF en tiempo discreto: h(x_{k+1}) - (1 - gamma) * h(x_k) >= 0.
-        Se activa únicamente cuando existe un obstáculo detectado.
-        """
-        if obstacle_pos is None:
-            return np.array([0.0])
-
-        u = u_flat.reshape((self.N, 2))
-        x_obs, y_obs = obstacle_pos[0], obstacle_pos[1]
-        
-        cbf_violations = []
-        x_curr = current_state.copy()
-
-        for k in range(self.N):
-            x_next = KinematicBicycleModel.step(x_curr, u[k])
-
-            v_k = max(x_curr[2], 0.1)
-            R_margin = 2.5 + 0.3 * v_k
-
-            h_curr = (x_curr[0] - x_obs)**2 + (x_curr[1] - y_obs)**2 - R_margin**2
-            h_next = (x_next[0] - x_obs)**2 + (x_next[1] - y_obs)**2 - R_margin**2
-            
-            cbf_violations.append((h_next - h_curr) + gamma * h_curr)
-            x_curr = x_next
-
-        return np.array(cbf_violations)
-
-    def _cost_function(self, u_flat, current_state, reference_trajectory, u_warm):
-        """
-        Calcula la función de costo proyectando las desviaciones lineales:
-        \delta x_{k+1} = A_k \delta x_k + B_k \delta u_k
-        """
-        u = u_flat.reshape((self.N, 2))
-        cost = 0.0
-
-        # Obtención de la trayectoria nominal y jacobianos en el punto de operación u_warm
-        x_bar, A_seq, B_seq = self._predict_trajectory(current_state, u_warm)
-        delta_x = np.zeros(4)
-
-        for i in range(self.N):
-            delta_u = u[i] - u_warm[i]
-            delta_x = np.dot(A_seq[i], delta_x) + np.dot(B_seq[i], delta_u)
-            state_pred = x_bar[i + 1] + delta_x
-
-            ref_x, ref_y, ref_v = reference_trajectory[i]
-
-            # Términos de error cuadrático
-            cost_pos = ((state_pred[0] - ref_x) ** 2 + (state_pred[1] - ref_y) ** 2) / (2.0 ** 2)
-            cost_spd = (state_pred[2] - ref_v) ** 2 / (5.0 ** 2)
-            cost_ctrl = (u[i, 0] ** 2) / (0.5 ** 2) + (u[i, 1] ** 2) / (1.0 ** 2)
-            
-            if i > 0:
-                cost_ctrl += ((u[i, 0] - u[i - 1, 0]) ** 2) / (0.1 ** 2)
-                cost_ctrl += ((u[i, 1] - u[i - 1, 1]) ** 2) / (2.0 ** 2)
-
-            cost += 0.60 * cost_pos + 0.20 * cost_spd + 0.20 * cost_ctrl
-
-        return cost
-
     def solve(self, u0_warm, current_state, reference_trajectory, obstacle_pos=None):
         u_warm = u0_warm.reshape((self.N, 2))
-        bounds = [(-1.0, 1.0)] * (self.N * 2)
+        x_bar, A_seq, B_seq = self._predict_trajectory(current_state, u_warm)
 
-        constraints = []
+        # 1. Matriz de proyección S_u
+        S_u = np.zeros((4 * self.N, 2 * self.N))
+        for k in range(self.N):
+            for j in range(k + 1):
+                if k == j:
+                    S_u[4*k:4*(k+1), 2*j:2*(j+1)] = B_seq[j]
+                else:
+                    A_prod = np.eye(4)
+                    for m in range(j + 1, k + 1):
+                        A_prod = A_seq[m] @ A_prod
+                    S_u[4*k:4*(k+1), 2*j:2*(j+1)] = A_prod @ B_seq[j]
+
+        # 2. Matrices Q y R (sin penalización en theta)
+        Q_block = np.diag([self.w_pos, self.w_pos, self.w_spd, 0.0])
+        Q = sparse.kron(sparse.eye(self.N), Q_block)
+
+        R_block = np.diag([self.w_ctrl_steer, self.w_ctrl_acc])
+        R = sparse.kron(sparse.eye(self.N), R_block)
+
+        D_diff = np.zeros((2 * (self.N - 1), 2 * self.N))
+        R_d_diag = np.tile([self.w_dctrl_steer, self.w_dctrl_acc], self.N - 1)
+        R_d = sparse.diags(R_d_diag)
+
+        for i in range(self.N - 1):
+            D_diff[2*i:2*(i+1), 2*i:2*(i+1)] = -np.eye(2)
+            D_diff[2*i:2*(i+1), 2*(i+1):2*(i+2)] = np.eye(2)
+
+        # 3. Vector de error E
+        E = np.zeros(4 * self.N)
+        for i in range(self.N):
+            ref_x, ref_y, ref_v = reference_trajectory[i]
+            E[4*i] = x_bar[i + 1, 0] - ref_x
+            E[4*i + 1] = x_bar[i + 1, 1] - ref_y
+            E[4*i + 2] = x_bar[i + 1, 2] - ref_v
+
+        # 4. Formulación de Hessiana P y gradiente q
+        P_dense = S_u.T @ Q @ S_u + R.toarray() + D_diff.T @ R_d @ D_diff
+        P = sparse.csc_matrix(P_dense)
+        q = S_u.T @ Q @ E - D_diff.T @ R_d @ D_diff @ u_warm.flatten()
+
+        # 5. Límites físicos de control (-1.0 <= u <= 1.0)
+        A_bounds = sparse.eye(2 * self.N, format='csc')
+        l_bounds = -np.ones(2 * self.N)
+        u_bounds = np.ones(2 * self.N)
+
+        A_list = [A_bounds]
+        l_list = [l_bounds]
+        u_list = [u_bounds]
+
+        # 6. Restricción CBF
         if obstacle_pos is not None:
-            constraints.append({
-                'type': 'ineq',
-                'fun': self._cbf_constraint_multistep,
-                'args': (current_state, obstacle_pos)
-            })
+            x_obs, y_obs = obstacle_pos[0], obstacle_pos[1]
+            A_cbf = np.zeros((self.N, 2 * self.N))
+            l_cbf = np.zeros(self.N)
+            u_cbf = np.full(self.N, np.inf)
 
-        res = minimize(
-            self._cost_function,
-            u0_warm,
-            args=(current_state, reference_trajectory, u_warm),
-            bounds=bounds,
-            constraints=constraints,
-            method='SLSQP',
-            options={'maxiter': 50, 'ftol': 1e-3}
-        )
+            x_curr = current_state.copy()
+            for k in range(self.N):
+                v_k = max(x_curr[2], 0.1)
+                R_margin = 2.5 + 0.3 * v_k
 
-        if res.success:
-            return res.x.reshape((self.N, 2)), res.x
-        
-        return u_warm, u0_warm.flatten()
+                dh_dx = 2 * (x_curr[0] - x_obs)
+                dh_dy = 2 * (x_curr[1] - y_obs)
+                grad_h = np.array([dh_dx, dh_dy, 0.0, 0.0])
+
+                A_cbf[k, :] = grad_h @ S_u[4*k:4*(k+1), :]
+                h_curr = (x_curr[0] - x_obs)**2 + (x_curr[1] - y_obs)**2 - R_margin**2
+                l_cbf[k] = -GAMMA_CBF * h_curr
+
+                x_curr = KinematicBicycleModel.step(x_curr, u_warm[k])
+
+            A_list.append(sparse.csc_matrix(A_cbf))
+            l_list.append(l_cbf)
+            u_list.append(u_cbf)
+
+        A_qp = sparse.vstack(A_list, format='csc')
+        l_qp = np.hstack(l_list)
+        u_qp = np.hstack(u_list)
+
+        # 7. Resolver en OSQP
+        prob = osqp.OSQP()
+        prob.setup(P, q, A_qp, l_qp, u_qp, verbose=False, eps_abs=1e-3, eps_rel=1e-3)
+        res = prob.solve()
+
+        if res.info.status == 'solved':
+            u_opt = res.x.reshape((self.N, 2))
+            return u_opt, res.x
+
+        u_brake = u_warm.copy()
+        u_brake[:, 1] = -1.0
+        return u_brake, u_brake.flatten()

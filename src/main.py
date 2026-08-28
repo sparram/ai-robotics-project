@@ -20,13 +20,14 @@ def run(control_type="MPC-CBF"):
 
     num_escenarios = 1
     start_seed = 37
-    VIDEO_SKIP = 5
+    VIDEO_SKIP = 3  # Ajustado para mayor fluidez en el video
 
+    # 1. ACTIVAMOS EL TRÁFICO (traffic_density > 0)
     env = MetaDriveEnv(dict(
         use_render=False,
         num_scenarios=num_escenarios,
         start_seed=start_seed,
-        traffic_density=0.0,
+        traffic_density=0.15,  # <-- Tráfico activo
         map="OCCO",
         crash_object_done=False,
         out_of_road_done=False
@@ -39,7 +40,7 @@ def run(control_type="MPC-CBF"):
         rl_agent = RLController("models_checkpoints/ppo_metadrive.zip")
     else:
         raise ValueError("Selecciona un controlador válido: MPC-CBF o RL")
-        
+
     writer = imageio.get_writer(VIDEO_FILENAME, fps=FPS)
     resultados = []
 
@@ -68,7 +69,7 @@ def run(control_type="MPC-CBF"):
                 errores_laterales.append(abs(lat_error))
 
                 # -------------------------------------------------------------
-                # 1. MODO CONTROL RL
+                # MODO RL
                 # -------------------------------------------------------------
                 if control_type == "RL":
                     u_nom_first = rl_agent.solve(obs)
@@ -92,69 +93,69 @@ def run(control_type="MPC-CBF"):
                                 u_nom_first[1] = -1.0
                                 obstacle_pos = np.array([v.position[0], v.position[1]])
                                 break
-                            elif 0 < d_fwd < 10.0 and abs(d_right) < 1.5:
-                                u_nom_first[1] = min(u_nom_first[1], 0.05)
-                                obstacle_pos = np.array([v.position[0], v.position[1]])
-                                break
 
                 # -------------------------------------------------------------
-                # 2. MODO CONTROL MPC-CBF (CON AVALÚO PURO DEL CBF)
+                # MODO MPC-CBF
                 # -------------------------------------------------------------
                 elif control_type == "MPC-CBF":
                     if step % MPC_SKIP_STEPS == 0:
                         ref_trajectory = []
-                        target_speed = 8.0
+                        
+                        # 1. Velocidad adaptativa: reducir a 5.0 m/s si estamos en curva/rotonda
+                        is_curved = abs(lane.heading_theta_at(current_s + 5) - lane.heading_theta_at(current_s)) > 0.1
+                        target_speed = 5.0 if is_curved else 8.0
+                
                         for i in range(N):
                             target_s = current_s + target_speed * (i + 1) * DT
                             ref_x, ref_y = lane.position(target_s, 0)
                             ref_trajectory.append((ref_x, ref_y, target_speed))
-
-                        heading_vec = np.array([np.cos(state_real[3]), np.sin(state_real[3])])
+                
+                        # 2. Detección de obstáculos en Coordenadas Frenet (s, d)
                         obstacle_pos = None
+                        min_delta_s = 20.0  # Rango máximo de búsqueda longitudinal
+                
                         vehicles = env.engine.traffic_manager.vehicles
-                        min_dist = 25.0
-
-                        # Detección del obstáculo frontal
                         for v in vehicles:
                             if v != vehicle:
-                                rel_pos = v.position - vehicle.position
-                                dist_adelante = np.dot(rel_pos, heading_vec)
-                                dist_total = np.linalg.norm(rel_pos)
-
-                                if 0 < dist_adelante < min_dist and dist_total < min_dist:
-                                    min_dist = dist_adelante
+                                # Proyectar obstáculo al carril del ego
+                                s_obs, d_obs = lane.local_coordinates(v.position)
+                                delta_s = s_obs - current_s
+                
+                                # Evaluar si está adelante (delta_s > 0) y en nuestro carril (|d_obs| < 1.8m)
+                                if 0 < delta_s < min_delta_s and abs(d_obs) < 1.8:
+                                    min_delta_s = delta_s
                                     obstacle_pos = np.array([v.position[0], v.position[1]])
-
-                        # AEB como respaldo de emergencia extremo (sin eclipsar al CBF)
+                
+                        # 3. Frenado de emergencia si la distancia longitudinal en carril es crítica
                         freno_emergencia = False
                         if obstacle_pos is not None:
-                            dist_obs = np.linalg.norm(state_real[:2] - obstacle_pos)
                             v_curr = max(state_real[2], 0.0)
-                            dist_critica_aeb = 2.0 + 0.1 * v_curr  # Solo salta si falla el CBF
-                            if dist_obs < dist_critica_aeb:
+                            dist_critica_aeb = 3.0 + 0.15 * v_curr
+                            if min_delta_s < dist_critica_aeb:
                                 freno_emergencia = True
-
-                        # Resolver optimización restringida por CBF
+                
                         u_nom_seq, u0_warm_flat = mpc_cbf.solve(
                             u0_warm,
                             state_real,
                             ref_trajectory,
                             obstacle_pos=obstacle_pos
                         )
-
+                
                         if freno_emergencia:
                             u_nom_first = np.array([u_nom_seq[0, 0], -1.0])
                         else:
                             u_nom_first = u_nom_seq[0]
-
+                
                         u0_warm = np.roll(u0_warm_flat, -2)
                         u0_warm[-2:] = u0_warm[-4:-2]
 
-                # Aplicar la acción en la simulación
+                # Aplicar acción
                 obs, reward, terminated, truncated, info = env.step(u_nom_first)
                 pasos_completados += 1
 
-                # Visualización y grabación de video
+                # -------------------------------------------------------------
+                # RENDERIZADO Y VISUALIZACIÓN DE CONTROL Y BARRERAS
+                # -------------------------------------------------------------
                 if step % VIDEO_SKIP == 0:
                     screen_w, screen_h = 608, 608
                     scaling = 5
@@ -170,11 +171,50 @@ def run(control_type="MPC-CBF"):
                             "seed": seed,
                             "step": step,
                             "speed_kmh": round(state_real[2] * 3.6, 1),
-                            "mode": control_type
+                            "mode": control_type,
+                            "steer": round(u_nom_first[0], 2),
+                            "accel": round(u_nom_first[1], 2)
                         }
                     )
 
-                    # Anillos visuales para observar la acción del CBF
+                    car_cx, car_cy = screen_w // 2, screen_h // 2
+
+                    # 1. DIBUJAR FLECHA DE CONTROL (VECTOR U)
+                    u_steer, u_acc = u_nom_first[0], u_nom_first[1]
+                    scale_vec = 45.0  # Escala visual en píxeles
+
+                    # En vista Top-Down con vehículo orientado hacia ARRIBA:
+                    # - Aceleración positiva = sube en la imagen (-Y)
+                    # - Giro positivo (izquierda) = izquierda en la imagen (-X)
+                    end_x = int(car_cx - u_steer * scale_vec)
+                    end_y = int(car_cy - u_acc * scale_vec)
+
+                    # Color: Verde si acelera, Rojo si frena
+                    color_vector = (0, 255, 0) if u_acc >= 0 else (0, 0, 255)
+
+                    # Dibujar vector desde el centro del vehículo
+                    cv2.arrowedLine(
+                        frame,
+                        (car_cx, car_cy),
+                        (end_x, end_y),
+                        color_vector,
+                        3,
+                        tipLength=0.35
+                    )
+
+                    # Leyenda en pantalla para la flecha
+                    cv2.putText(
+                        frame,
+                        f"Control Vector (u_steer: {u_steer:.2f}, u_acc: {u_acc:.2f})",
+                        (20, screen_h - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 255),
+                        1,
+                        cv2.LINE_AA
+                    )
+
+                    # 2. DIBUJAR ANILLOS DE SEGURIDAD (CBF y AEB)
                     if control_type == "MPC-CBF" and obstacle_pos is not None:
                         v_curr = max(state_real[2], 0.0)
                         r_cbf_m = 2.5 + 0.3 * v_curr
@@ -189,28 +229,13 @@ def run(control_type="MPC-CBF"):
                         center_x = int(screen_w / 2 + d_right * scaling)
                         center_y = int(screen_h / 2 - d_fwd * scaling)
 
-                        # Amarillo: Límite CBF | Rojo: Límite AEB Pánico
+                        # Amarillo: Límite CBF | Rojo: Límite AEB
                         cv2.circle(frame, (center_x, center_y), int(r_cbf_m * scaling), (255, 255, 0), 2)
-                        cv2.circle(frame, (center_x, center_y), int(r_aeb_m * scaling), (255, 0, 0), 2)
-
-                    elif control_type == "RL" and obstacle_pos is not None:
-                        v_curr = max(state_real[2], 0.0)
-                        r_aeb_m = 6.0 + 0.6 * v_curr
-
-                        rel_pos = obstacle_pos - state_real[:2]
-                        theta = state_real[3]
-
-                        d_fwd = rel_pos[0] * np.cos(theta) + rel_pos[1] * np.sin(theta)
-                        d_right = rel_pos[0] * np.sin(theta) - rel_pos[1] * np.cos(theta)
-
-                        center_x = int(screen_w / 2 + d_right * scaling)
-                        center_y = int(screen_h / 2 - d_fwd * scaling)
-
                         cv2.circle(frame, (center_x, center_y), int(r_aeb_m * scaling), (255, 0, 0), 2)
 
                     writer.append_data(frame)
 
-                # Registro de desviaciones de carril
+                # Métricas de salida de carril
                 ancho_carril = lane.width
                 limite_borde = ancho_carril / 2.0
                 if abs(lat_error) > limite_borde:
