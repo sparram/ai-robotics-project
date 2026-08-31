@@ -70,7 +70,6 @@ class MPC_CBF:
             E_base[4*i + 1] = x_bar[i + 1, 1] - ref_y
             E_base[4*i + 2] = x_bar[i + 1, 2] - ref_v
 
-        # Restamos S_u @ u_warm_flat para corregir la expansión de Taylor del estado
         E = E_base - S_u @ u_warm_flat
 
         # 4. Hessiana P y gradiente q
@@ -87,7 +86,7 @@ class MPC_CBF:
         l_list = [l_bounds]
         u_list = [u_bounds]
 
-        # 6. RESTRICCIONES MULTI-CBF EN TIEMPO DISCRETO
+        # 6. RESTRICCIONES MULTI-CBF CON PROPAGACIÓN DINÁMICA
         if obstacles_list is not None and len(obstacles_list) > 0:
             M = len(obstacles_list)
             A_cbf = np.zeros((M * self.N, 2 * self.N))
@@ -95,10 +94,18 @@ class MPC_CBF:
             u_cbf = np.full(M * self.N, np.inf)
 
             row_idx = 0
-            for obs_pos in obstacles_list:
-                x_obs, y_obs = obs_pos[0], obs_pos[1]
+            for obs in obstacles_list:
+                x_obs0, y_obs0 = obs[0], obs[1]
+                vx_obs = obs[2] if len(obs) > 2 else 0.0
+                vy_obs = obs[3] if len(obs) > 3 else 0.0
 
                 for k in range(self.N):
+                    # Posición predicha del obstáculo en k y k+1
+                    obs_xk = x_obs0 + vx_obs * (k * DT)
+                    obs_yk = y_obs0 + vy_obs * (k * DT)
+                    obs_xk1 = x_obs0 + vx_obs * ((k + 1) * DT)
+                    obs_yk1 = y_obs0 + vy_obs * ((k + 1) * DT)
+
                     # Estados predichos en paso k y paso k+1
                     x_k = x_bar[k]
                     x_k1 = x_bar[k + 1]
@@ -106,21 +113,20 @@ class MPC_CBF:
                     v_k1 = max(x_k1[2], 0.1)
                     R_margin = 1.4 + 0.2 * v_k1
 
-                    # h(x) evaluado en k y k+1
-                    h_k = (x_k[0] - x_obs)**2 + (x_k[1] - y_obs)**2 - R_margin**2
-                    h_k1 = (x_k1[0] - x_obs)**2 + (x_k1[1] - y_obs)**2 - R_margin**2
+                    # h(x) evaluado con la posición dinámica del obstáculo
+                    h_k = (x_k[0] - obs_xk)**2 + (x_k[1] - obs_yk)**2 - R_margin**2
+                    h_k1 = (x_k1[0] - obs_xk1)**2 + (x_k1[1] - obs_yk1)**2 - R_margin**2
 
-                    # Gradiente evaluado en el estado k+1
-                    dh_dx = 2 * (x_k1[0] - x_obs)
-                    dh_dy = 2 * (x_k1[1] - y_obs)
+                    # Gradiente evaluado respecto al estado k+1
+                    dh_dx = 2 * (x_k1[0] - obs_xk1)
+                    dh_dy = 2 * (x_k1[1] - obs_yk1)
                     grad_h_k1 = np.array([dh_dx, dh_dy, 0.0, 0.0])
 
                     S_u_k1 = S_u[4*k:4*(k+1), :]
                     A_cbf[row_idx, :] = grad_h_k1 @ S_u_k1
 
-                    # Condición discreta: h(x_{k+1}) >= (1 - gamma) * h(x_k)
+                    # Condición discreta CBF
                     l_cbf[row_idx] = (1.0 - GAMMA_CBF) * h_k - h_k1 + A_cbf[row_idx, :] @ u_warm_flat
-
                     row_idx += 1
 
             A_list.append(sparse.csc_matrix(A_cbf))
@@ -140,7 +146,7 @@ class MPC_CBF:
             u_opt = res.x.reshape((self.N, 2))
             return u_opt, res.x
 
-        # 8. ESTRATEGIA DE MANEJO DE INFACTIBILIDAD (FALLBACK)
+        # 8. Estrategia de respaldo (Fallback)
         u_fallback = u_warm.copy()
         v_actual = current_state[2]
 
