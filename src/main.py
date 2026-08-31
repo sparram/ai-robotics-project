@@ -19,7 +19,7 @@ def run(control_type="MPC-CBF"):
         close_engine()
 
     num_escenarios = 10
-    start_seed = 38
+    start_seed = 37
     VIDEO_SKIP = 5  # Ajustado para mayor fluidez en el video
 
     # 1. ACTIVAMOS EL TRÁFICO (traffic_density > 0)

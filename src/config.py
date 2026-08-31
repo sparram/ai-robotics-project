@@ -10,4 +10,4 @@ TOTAL_STEPS = 2000     # Total pasos de la simulación
 
 # Parámetros para la generación del video
 FPS = 15
-VIDEO_FILENAME = "media/mpc_cbf_example2.mp4"
+VIDEO_FILENAME = "media/mpc_cbf_example.mp4"
