@@ -32,9 +32,10 @@ class MPC_CBF:
 
     def solve(self, u0_warm, current_state, reference_trajectory, obstacles_list=None):
         u_warm = u0_warm.reshape((self.N, 2))
+        u_warm_flat = u_warm.flatten()
         x_bar, A_seq, B_seq = self._predict_trajectory(current_state, u_warm)
 
-        # 1. Matriz de proyección S_u
+        # 1. Matriz de proyección S_u (4N x 2N)
         S_u = np.zeros((4 * self.N, 2 * self.N))
         for k in range(self.N):
             for j in range(k + 1):
@@ -46,7 +47,7 @@ class MPC_CBF:
                         A_prod = A_seq[m] @ A_prod
                     S_u[4*k:4*(k+1), 2*j:2*(j+1)] = A_prod @ B_seq[j]
 
-        # 2. Matrices Q y R
+        # 2. Matrices de costo Q y R
         Q_block = np.diag([self.w_pos, self.w_pos, self.w_spd, 0.0])
         Q = sparse.kron(sparse.eye(self.N), Q_block)
 
@@ -61,18 +62,21 @@ class MPC_CBF:
             D_diff[2*i:2*(i+1), 2*i:2*(i+1)] = -np.eye(2)
             D_diff[2*i:2*(i+1), 2*(i+1):2*(i+2)] = np.eye(2)
 
-        # 3. Vector de error E
-        E = np.zeros(4 * self.N)
+        # 3. Vector de error E compensado por linealización en u_warm
+        E_base = np.zeros(4 * self.N)
         for i in range(self.N):
             ref_x, ref_y, ref_v = reference_trajectory[i]
-            E[4*i] = x_bar[i + 1, 0] - ref_x
-            E[4*i + 1] = x_bar[i + 1, 1] - ref_y
-            E[4*i + 2] = x_bar[i + 1, 2] - ref_v
+            E_base[4*i]     = x_bar[i + 1, 0] - ref_x
+            E_base[4*i + 1] = x_bar[i + 1, 1] - ref_y
+            E_base[4*i + 2] = x_bar[i + 1, 2] - ref_v
+
+        # Restamos S_u @ u_warm_flat para corregir la expansión de Taylor del estado
+        E = E_base - S_u @ u_warm_flat
 
         # 4. Hessiana P y gradiente q
         P_dense = S_u.T @ Q @ S_u + R.toarray() + D_diff.T @ R_d @ D_diff
         P = sparse.csc_matrix(P_dense)
-        q = S_u.T @ Q @ E - D_diff.T @ R_d @ D_diff @ u_warm.flatten()
+        q = S_u.T @ Q @ E - D_diff.T @ R_d @ D_diff @ u_warm_flat
 
         # 5. Límites físicos (-1.0 <= u <= 1.0)
         A_bounds = sparse.eye(2 * self.N, format='csc')
@@ -83,7 +87,7 @@ class MPC_CBF:
         l_list = [l_bounds]
         u_list = [u_bounds]
 
-        # 6. RESTRICCIONES MULTI-CBF (M obstáculos x N pasos del horizonte)
+        # 6. RESTRICCIONES MULTI-CBF EN TIEMPO DISCRETO
         if obstacles_list is not None and len(obstacles_list) > 0:
             M = len(obstacles_list)
             A_cbf = np.zeros((M * self.N, 2 * self.N))
@@ -93,23 +97,31 @@ class MPC_CBF:
             row_idx = 0
             for obs_pos in obstacles_list:
                 x_obs, y_obs = obs_pos[0], obs_pos[1]
-                x_curr = current_state.copy()
 
                 for k in range(self.N):
-                    v_k = max(x_curr[2], 0.1)
-                    # Radio ajustado para adecuarse al ancho real de carril
-                    R_margin = 1.4 + 0.2 * v_k
+                    # Estados predichos en paso k y paso k+1
+                    x_k = x_bar[k]
+                    x_k1 = x_bar[k + 1]
 
-                    dh_dx = 2 * (x_curr[0] - x_obs)
-                    dh_dy = 2 * (x_curr[1] - y_obs)
-                    grad_h = np.array([dh_dx, dh_dy, 0.0, 0.0])
+                    v_k1 = max(x_k1[2], 0.1)
+                    R_margin = 1.4 + 0.2 * v_k1
 
-                    A_cbf[row_idx, :] = grad_h @ S_u[4*k:4*(k+1), :]
-                    h_curr = (x_curr[0] - x_obs)**2 + (x_curr[1] - y_obs)**2 - R_margin**2
-                    l_cbf[row_idx] = -GAMMA_CBF * h_curr
+                    # h(x) evaluado en k y k+1
+                    h_k = (x_k[0] - x_obs)**2 + (x_k[1] - y_obs)**2 - R_margin**2
+                    h_k1 = (x_k1[0] - x_obs)**2 + (x_k1[1] - y_obs)**2 - R_margin**2
+
+                    # Gradiente evaluado en el estado k+1
+                    dh_dx = 2 * (x_k1[0] - x_obs)
+                    dh_dy = 2 * (x_k1[1] - y_obs)
+                    grad_h_k1 = np.array([dh_dx, dh_dy, 0.0, 0.0])
+
+                    S_u_k1 = S_u[4*k:4*(k+1), :]
+                    A_cbf[row_idx, :] = grad_h_k1 @ S_u_k1
+
+                    # Condición discreta: h(x_{k+1}) >= (1 - gamma) * h(x_k)
+                    l_cbf[row_idx] = (1.0 - GAMMA_CBF) * h_k - h_k1 + A_cbf[row_idx, :] @ u_warm_flat
 
                     row_idx += 1
-                    x_curr = KinematicBicycleModel.step(x_curr, u_warm[k])
 
             A_list.append(sparse.csc_matrix(A_cbf))
             l_list.append(l_cbf)
@@ -119,7 +131,7 @@ class MPC_CBF:
         l_qp = np.hstack(l_list)
         u_qp = np.hstack(u_list)
 
-        # 7. Resolver en OSQP
+        # 7. Resolver con OSQP
         prob = osqp.OSQP()
         prob.setup(P, q, A_qp, l_qp, u_qp, verbose=False, eps_abs=1e-3, eps_rel=1e-3)
         res = prob.solve()
@@ -128,16 +140,14 @@ class MPC_CBF:
             u_opt = res.x.reshape((self.N, 2))
             return u_opt, res.x
 
-        # 8. ESTRATEGIA DE MANEJO DE INFEACTIBILIDAD
+        # 8. ESTRATEGIA DE MANEJO DE INFACTIBILIDAD (FALLBACK)
         u_fallback = u_warm.copy()
         v_actual = current_state[2]
 
         if v_actual < 0.8:
-            # Si el vehículo está detenido o muy lento, avanza suave con giro para recuperar aceleración lateral
-            u_fallback[:, 0] = 0.4   # Giro proactivo para salir de la barrera
+            u_fallback[:, 0] = 0.4   # Giro suave para salir del bloqueo
             u_fallback[:, 1] = 0.15  # Impulso suave
         else:
-            # Si viene con velocidad, aplica frenado de emergencia
-            u_fallback[:, 1] = -1.0
+            u_fallback[:, 1] = -1.0  # Frenado de emergencia
 
         return u_fallback, u_fallback.flatten()
