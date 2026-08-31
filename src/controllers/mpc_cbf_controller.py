@@ -16,6 +16,91 @@ class MPC_CBF:
         self.w_dctrl_steer = 0.20 / (0.1 ** 2)
         self.w_dctrl_acc = 0.20 / (2.0 ** 2)
 
+    def _extract_obstacles(self, env, vehicle_pos, max_dist=18.0):
+        obstacles_list = []
+        vehicles = env.engine.traffic_manager.vehicles
+        for v in vehicles:
+            if v != env.agent:
+                dist = np.linalg.norm(v.position - vehicle_pos)
+                if dist < max_dist:
+                    v_m_s = max(v.speed_km_h / 3.6, 0.0)
+                    heading = v.heading_theta
+                    vx = v_m_s * np.cos(heading)
+                    vy = v_m_s * np.sin(heading)
+                    obstacles_list.append(np.array([v.position[0], v.position[1], vx, vy]))
+        return obstacles_list
+
+    def _get_lane_safe(self, road_net, road_index):
+        if road_index[2] < 0:
+            return None
+        try:
+            return road_net.get_lane(road_index)
+        except (KeyError, AttributeError, IndexError):
+            return None
+
+    def _is_lane_blocked(self, lane_obj, state_real, obstacles_list):
+        if lane_obj is None:
+            return True
+        s_e, _ = lane_obj.local_coordinates(state_real[:2])
+        for obs in obstacles_list:
+            s_o, lat_o = lane_obj.local_coordinates(obs[:2])
+            d_fwd = s_o - s_e
+            if 0.0 < d_fwd < 18.0 and abs(lat_o) < 1.5:
+                return True
+        return False
+
+    def _generate_ref_trajectory(self, target_lane, state_real, should_stop):
+        ref_trajectory = []
+        s_ego_target, _ = target_lane.local_coordinates(state_real[:2])
+        is_curved = abs(target_lane.heading_theta_at(s_ego_target + 5) - target_lane.heading_theta_at(s_ego_target)) > 0.1
+        base_speed = 5.0 if is_curved else 8.0
+        target_speed = 0.0 if should_stop else base_speed
+
+        for i in range(self.N):
+            target_s = s_ego_target + target_speed * (i + 1) * DT
+            ref_x, ref_y = target_lane.position(target_s, 0.0)
+            ref_trajectory.append((ref_x, ref_y, target_speed))
+
+        return ref_trajectory
+
+    def get_action(self, env, state_real, u0_warm):
+        """Pipeline completo: Escaneo -> Selección de Carril -> Trayectoria -> Solución OSQP."""
+        vehicle = env.agent
+        obstacles_list = self._extract_obstacles(env, vehicle.position)
+
+        road_net = env.engine.map_manager.current_map.road_network
+        current_road = vehicle.lane_index
+        current_lane = vehicle.lane
+
+        target_lane = current_lane
+        should_stop = False
+
+        if self._is_lane_blocked(current_lane, state_real, obstacles_list):
+            left_index = (current_road[0], current_road[1], current_road[2] - 1)
+            right_index = (current_road[0], current_road[1], current_road[2] + 1)
+
+            left_lane = self._get_lane_safe(road_net, left_index)
+            right_lane = self._get_lane_safe(road_net, right_index)
+
+            if left_lane is not None and not self._is_lane_blocked(left_lane, state_real, obstacles_list):
+                target_lane = left_lane
+            elif right_lane is not None and not self._is_lane_blocked(right_lane, state_real, obstacles_list):
+                target_lane = right_lane
+            else:
+                should_stop = True
+
+        ref_trajectory = self._generate_ref_trajectory(target_lane, state_real, should_stop)
+
+        u_nom_seq, u0_warm_flat = self.solve(
+            u0_warm, state_real, ref_trajectory, obstacles_list=obstacles_list
+        )
+
+        u_nom_first = u_nom_seq[0]
+        u0_warm_next = np.roll(u0_warm_flat, -2)
+        u0_warm_next[-2:] = u0_warm_next[-4:-2]
+
+        return u_nom_first, u0_warm_next, obstacles_list
+
     def _predict_trajectory(self, current_state, u_seq):
         x_bar = np.zeros((self.N + 1, 4))
         x_bar[0] = current_state
@@ -100,24 +185,20 @@ class MPC_CBF:
                 vy_obs = obs[3] if len(obs) > 3 else 0.0
 
                 for k in range(self.N):
-                    # Posición predicha del obstáculo en k y k+1
                     obs_xk = x_obs0 + vx_obs * (k * DT)
                     obs_yk = y_obs0 + vy_obs * (k * DT)
                     obs_xk1 = x_obs0 + vx_obs * ((k + 1) * DT)
                     obs_yk1 = y_obs0 + vy_obs * ((k + 1) * DT)
 
-                    # Estados predichos en paso k y paso k+1
                     x_k = x_bar[k]
                     x_k1 = x_bar[k + 1]
 
                     v_k1 = max(x_k1[2], 0.1)
                     R_margin = 1.4 + 0.2 * v_k1
 
-                    # h(x) evaluado con la posición dinámica del obstáculo
                     h_k = (x_k[0] - obs_xk)**2 + (x_k[1] - obs_yk)**2 - R_margin**2
                     h_k1 = (x_k1[0] - obs_xk1)**2 + (x_k1[1] - obs_yk1)**2 - R_margin**2
 
-                    # Gradiente evaluado respecto al estado k+1
                     dh_dx = 2 * (x_k1[0] - obs_xk1)
                     dh_dy = 2 * (x_k1[1] - obs_yk1)
                     grad_h_k1 = np.array([dh_dx, dh_dy, 0.0, 0.0])
@@ -125,7 +206,6 @@ class MPC_CBF:
                     S_u_k1 = S_u[4*k:4*(k+1), :]
                     A_cbf[row_idx, :] = grad_h_k1 @ S_u_k1
 
-                    # Condición discreta CBF
                     l_cbf[row_idx] = (1.0 - GAMMA_CBF) * h_k - h_k1 + A_cbf[row_idx, :] @ u_warm_flat
                     row_idx += 1
 
@@ -151,9 +231,9 @@ class MPC_CBF:
         v_actual = current_state[2]
 
         if v_actual < 0.8:
-            u_fallback[:, 0] = 0.4   # Giro suave para salir del bloqueo
-            u_fallback[:, 1] = 0.15  # Impulso suave
+            u_fallback[:, 0] = 0.4    # Giro suave para salir del bloqueo
+            u_fallback[:, 1] = 0.15   # Impulso suave
         else:
-            u_fallback[:, 1] = -1.0  # Frenado de emergencia
+            u_fallback[:, 1] = -1.0   # Frenado de emergencia
 
         return u_fallback, u_fallback.flatten()
