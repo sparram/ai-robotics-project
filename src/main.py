@@ -97,45 +97,80 @@ def run(control_type="MPC-CBF"):
                 # -------------------------------------------------------------
                 elif control_type == "MPC-CBF":
                     if step % MPC_SKIP_STEPS == 0:
-                        # Recolectar Obstáculos en un radio de 18 metros
+                        # 1. Recolectar Obstáculos en un radio de 18 metros
                         obstacles_list = []
                         vehicles = env.engine.traffic_manager.vehicles
                         for v in vehicles:
                             if v != vehicle:
-                                v.set_static(True)  # Mantener congelados para pruebas
+                                #v.set_static(True)
                                 dist = np.linalg.norm(v.position - vehicle.position)
                                 if dist < 18.0:
                                     obstacles_list.append(np.array([v.position[0], v.position[1]]))
 
-                        # Detección curvilínea (Frenet) en el carril
-                        lat_offset = 0.0
-                        s_ego, lat_ego = lane.local_coordinates(state_real[:2])
+                        # 2. Obtener la red de carriles de MetaDrive
+                        road_net = env.engine.map_manager.current_map.road_network
+                        current_road = vehicle.lane_index  # Tupla: (nodo_inicio, nodo_fin, id_carril)
+                        current_lane = vehicle.lane
 
-                        for obs_pos in obstacles_list:
-                            s_obs, lat_obs = lane.local_coordinates(obs_pos)
-                            d_fwd = s_obs - s_ego          # Distancia longitudinal siguiendo la curva
-                            d_right = lat_obs - lat_ego    # Distancia transversal real dentro del carril
+                        # Función auxiliar para consultar un carril sin lanzar excepción si no existe
+                        def get_lane_safe(road_index):
+                            # Evitar índices negativos para prevenir que Python tome el último carril de la lista
+                            if road_index[2] < 0:
+                                return None
+                            try:
+                                return road_net.get_lane(road_index)
+                            except (KeyError, AttributeError, IndexError):
+                                return None
 
-                            # Detectar si hay un obstáculo adelante en la trayectoria del carril (< 18m)
-                            if 0.0 < d_fwd < 18.0 and abs(d_right) < 1.8:
-                                # Esquivar hacia el lado opuesto del obstáculo
-                                side = -1.0 if d_right >= 0 else 1.0
-                                lat_offset = side * 2.8  # Desplazamiento lateral de referencia
-                                break
+                        # Función auxiliar para verificar si un carril específico está bloqueado
+                        def is_lane_blocked(lane_obj):
+                            if lane_obj is None:
+                                return True
+                            s_e, _ = lane_obj.local_coordinates(state_real[:2])
+                            for obs_pos in obstacles_list:
+                                s_o, lat_o = lane_obj.local_coordinates(obs_pos)
+                                d_fwd = s_o - s_e
+                                # Si hay un auto adelante a menos de 18m dentro del ancho del carril
+                                if 0.0 < d_fwd < 18.0 and abs(lat_o) < 1.5:
+                                    return True
+                            return False
 
-                        # Construcción de la trayectoria de referencia con desvío
+                        # 3. Selección dinámica del carril objetivo (Target Lane)
+                        target_lane = current_lane
+                        should_stop = False
+
+                        if is_lane_blocked(current_lane):
+                            # Construir índices de carril izquierdo (-1) y derecho (+1)
+                            left_index = (current_road[0], current_road[1], current_road[2] - 1)
+                            right_index = (current_road[0], current_road[1], current_road[2] + 1)
+
+                            left_lane = get_lane_safe(left_index)
+                            right_lane = get_lane_safe(right_index)
+
+                            # Evaluar alternativa libre: prioriza carril izquierdo, luego derecho
+                            if left_lane is not None and not is_lane_blocked(left_lane):
+                                target_lane = left_lane
+                            elif right_lane is not None and not is_lane_blocked(right_lane):
+                                target_lane = right_lane
+                            else:
+                                # Todos los carriles disponibles están bloqueados
+                                should_stop = True
+
+                        # 4. Generación de la trayectoria de referencia sobre el target_lane
                         ref_trajectory = []
-                        is_curved = abs(lane.heading_theta_at(current_s + 5) - lane.heading_theta_at(current_s)) > 0.1
-                        target_speed = 5.0 if is_curved else 8.0
+                        s_ego_target, _ = target_lane.local_coordinates(state_real[:2])
+                        
+                        is_curved = abs(target_lane.heading_theta_at(s_ego_target + 5) - target_lane.heading_theta_at(s_ego_target)) > 0.1
+                        base_speed = 5.0 if is_curved else 8.0
+                        target_speed = 0.0 if should_stop else base_speed
 
                         for i in range(N):
-                            target_s = current_s + target_speed * (i + 1) * DT
-                            smooth_factor = min(1.0, (i + 1) / (N * 0.5))
-                            current_offset = lat_offset * smooth_factor
-                            
-                            ref_x, ref_y = lane.position(target_s, current_offset)
+                            target_s = s_ego_target + target_speed * (i + 1) * DT
+                            # Genera los puntos x, y usando la geometría nativa del carril seleccionado
+                            ref_x, ref_y = target_lane.position(target_s, 0.0)
                             ref_trajectory.append((ref_x, ref_y, target_speed))
 
+                        # 5. Resolver MPC-CBF
                         u_nom_seq, u0_warm_flat = mpc_cbf.solve(
                             u0_warm,
                             state_real,
