@@ -79,52 +79,70 @@ def run(control_type="MPC-CBF"):
                         u_nom_first[1] = min(u_nom_first[1], -0.3)
 
                     vehicles = env.engine.traffic_manager.vehicles
-                    theta = state_real[3]
                     dist_critica = 10.0 + 0.5 * v_curr
+                    s_ego, lat_ego = lane.local_coordinates(state_real[:2])
 
-                    obstacle_pos = None
                     for v in vehicles:
                         if v != vehicle:
-                            rel_pos = v.position - vehicle.position
-                            d_fwd = rel_pos[0] * np.cos(theta) + rel_pos[1] * np.sin(theta)
-                            d_right = rel_pos[0] * np.sin(theta) - rel_pos[1] * np.cos(theta)
+                            s_obs, lat_obs = lane.local_coordinates(v.position)
+                            d_fwd = s_obs - s_ego
+                            d_right = lat_obs - lat_ego
 
                             if 0 < d_fwd < dist_critica and abs(d_right) < 1.5:
                                 u_nom_first[1] = -1.0
-                                obstacle_pos = np.array([v.position[0], v.position[1]])
                                 break
 
                 # -------------------------------------------------------------
-                # MODO MPC-CBF MULTI-OBSTÁCULO
+                # MODO MPC-CBF CON DETECCIÓN FRENET EN CURVAS
                 # -------------------------------------------------------------
                 elif control_type == "MPC-CBF":
                     if step % MPC_SKIP_STEPS == 0:
-                        ref_trajectory = []
-                        
-                        is_curved = abs(lane.heading_theta_at(current_s + 5) - lane.heading_theta_at(current_s)) > 0.1
-                        target_speed = 5.0 if is_curved else 8.0
-                
-                        for i in range(N):
-                            target_s = current_s + target_speed * (i + 1) * DT
-                            ref_x, ref_y = lane.position(target_s, 0)
-                            ref_trajectory.append((ref_x, ref_y, target_speed))
-                
-                        # Recolectar TODOS los obstáculos en un radio de 18 metros
+                        # Recolectar Obstáculos en un radio de 18 metros
                         obstacles_list = []
                         vehicles = env.engine.traffic_manager.vehicles
                         for v in vehicles:
                             if v != vehicle:
+                                v.set_static(True)  # Mantener congelados para pruebas
                                 dist = np.linalg.norm(v.position - vehicle.position)
                                 if dist < 18.0:
                                     obstacles_list.append(np.array([v.position[0], v.position[1]]))
-                
+
+                        # Detección curvilínea (Frenet) en el carril
+                        lat_offset = 0.0
+                        s_ego, lat_ego = lane.local_coordinates(state_real[:2])
+
+                        for obs_pos in obstacles_list:
+                            s_obs, lat_obs = lane.local_coordinates(obs_pos)
+                            d_fwd = s_obs - s_ego          # Distancia longitudinal siguiendo la curva
+                            d_right = lat_obs - lat_ego    # Distancia transversal real dentro del carril
+
+                            # Detectar si hay un obstáculo adelante en la trayectoria del carril (< 18m)
+                            if 0.0 < d_fwd < 18.0 and abs(d_right) < 1.8:
+                                # Esquivar hacia el lado opuesto del obstáculo
+                                side = -1.0 if d_right >= 0 else 1.0
+                                lat_offset = side * 2.8  # Desplazamiento lateral de referencia
+                                break
+
+                        # Construcción de la trayectoria de referencia con desvío
+                        ref_trajectory = []
+                        is_curved = abs(lane.heading_theta_at(current_s + 5) - lane.heading_theta_at(current_s)) > 0.1
+                        target_speed = 5.0 if is_curved else 8.0
+
+                        for i in range(N):
+                            target_s = current_s + target_speed * (i + 1) * DT
+                            smooth_factor = min(1.0, (i + 1) / (N * 0.5))
+                            current_offset = lat_offset * smooth_factor
+                            
+                            ref_x, ref_y = lane.position(target_s, current_offset)
+                            ref_trajectory.append((ref_x, ref_y, target_speed))
+
                         u_nom_seq, u0_warm_flat = mpc_cbf.solve(
                             u0_warm,
                             state_real,
                             ref_trajectory,
                             obstacles_list=obstacles_list
                         )
-                
+
                         u_nom_first = u_nom_seq[0]
                         u0_warm = np.roll(u0_warm_flat, -2)
                         u0_warm[-2:] = u0_warm[-4:-2]
@@ -139,7 +157,7 @@ def run(control_type="MPC-CBF"):
                 if step % VIDEO_SKIP == 0:
                     screen_w, screen_h = 608, 608
                     scaling = 5
-                
+
                     frame = env.render(
                         mode="topdown",
                         window=False,
@@ -157,38 +175,34 @@ def run(control_type="MPC-CBF"):
                             "accel": round(u_nom_first[1], 2)
                         }
                     )
-                
+
                     car_cx, car_cy = screen_w // 2, screen_h // 2
-                
-                    # 1. Flecha de vector de control
+
+                    # Vector de control
                     u_steer, u_acc = u_nom_first[0], u_nom_first[1]
                     scale_vec = 45.0
                     end_x = int(car_cx - u_steer * scale_vec)
                     end_y = int(car_cy - u_acc * scale_vec)
                     color_vector = (0, 255, 0) if u_acc >= 0 else (0, 0, 255)
-                
+
                     cv2.arrowedLine(frame, (car_cx, car_cy), (end_x, end_y), color_vector, 3, tipLength=0.35)
-                
-                    # 2. Anillos de seguridad CBF para CADA obstáculo cercano
+
+                    # Anillos de seguridad CBF
                     if control_type == "MPC-CBF" and obstacles_list:
                         v_curr = max(state_real[2], 0.0)
-                        r_cbf_m = 2.5 + 0.3 * v_curr
+                        r_cbf_m = 1.4 + 0.2 * v_curr
                         theta = state_real[3]
-                
+
                         for obs_pos in obstacles_list:
                             rel_pos = obs_pos - state_real[:2]
-                
-                            # Transformación al sistema local del Ego (Heading-Up)
-                            d_fwd = rel_pos[0] * np.cos(theta) + rel_pos[1] * np.sin(theta)
-                            d_right = rel_pos[0] * np.sin(theta) - rel_pos[1] * np.cos(theta)
-                
-                            # Conversión a píxeles de pantalla
-                            center_x = int(screen_w / 2 + d_right * scaling)
-                            center_y = int(screen_h / 2 - d_fwd * scaling)
-                
-                            # Dibujar barrera CBF en amarillo para cada vehículo
+                            d_fwd_cam = rel_pos[0] * np.cos(theta) + rel_pos[1] * np.sin(theta)
+                            d_right_cam = rel_pos[0] * np.sin(theta) - rel_pos[1] * np.cos(theta)
+
+                            center_x = int(screen_w / 2 + d_right_cam * scaling)
+                            center_y = int(screen_h / 2 - d_fwd_cam * scaling)
+
                             cv2.circle(frame, (center_x, center_y), int(r_cbf_m * scaling), (255, 255, 0), 2)
-                
+
                     writer.append_data(frame)
 
                 # Métricas de salida de carril

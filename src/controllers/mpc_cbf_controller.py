@@ -97,7 +97,8 @@ class MPC_CBF:
 
                 for k in range(self.N):
                     v_k = max(x_curr[2], 0.1)
-                    R_margin = 2.5 + 0.3 * v_k
+                    # Radio ajustado para adecuarse al ancho real de carril
+                    R_margin = 1.4 + 0.2 * v_k
 
                     dh_dx = 2 * (x_curr[0] - x_obs)
                     dh_dy = 2 * (x_curr[1] - y_obs)
@@ -127,7 +128,16 @@ class MPC_CBF:
             u_opt = res.x.reshape((self.N, 2))
             return u_opt, res.x
 
-        # Si el problema es infactible (ej. encerrado por autos), frena
-        u_brake = u_warm.copy()
-        u_brake[:, 1] = -1.0
-        return u_brake, u_brake.flatten()
+        # 8. ESTRATEGIA DE MANEJO DE INFEACTIBILIDAD
+        u_fallback = u_warm.copy()
+        v_actual = current_state[2]
+
+        if v_actual < 0.8:
+            # Si el vehículo está detenido o muy lento, avanza suave con giro para recuperar aceleración lateral
+            u_fallback[:, 0] = 0.4   # Giro proactivo para salir de la barrera
+            u_fallback[:, 1] = 0.15  # Impulso suave
+        else:
+            # Si viene con velocidad, aplica frenado de emergencia
+            u_fallback[:, 1] = -1.0
+
+        return u_fallback, u_fallback.flatten()

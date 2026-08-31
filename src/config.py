@@ -6,7 +6,7 @@ L = 3.0                # Wheelbase (m)
 MPC_SKIP_STEPS = 1     # Pasos a omitir entre cálculos del MPC
 GAMMA_CBF = 0.2        # Gamma para la restricción CBF
 
-TOTAL_STEPS = 1000     # Total pasos de la simulación
+TOTAL_STEPS = 1200     # Total pasos de la simulación
 
 # Parámetros para la generación del video
 FPS = 15
