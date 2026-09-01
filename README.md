@@ -2,7 +2,7 @@
 
 This project develops a MPC controller combined with a Control Barrier Function (CBF), and compares it with a RL based controller for autonomous driving with Metadrive.
 
-<video src="./src/media/mpc_cbf_scenarios/video_MPC-CBF_seed_39.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/074b175a-760f-4ef3-8d26-a1c635e1ba4f
 
 **Author:** Santiago Parra  
 **Year:** 2026
