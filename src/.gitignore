@@ -6,5 +6,5 @@ __pycache__/
 *.pyc
 
 # Archivos temporales y videos generados por la simulación
-*.mp4
-*.avi
+# *.mp4
+# *.avi

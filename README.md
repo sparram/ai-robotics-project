@@ -1,6 +1,8 @@
-# Progetto: AI and Robotics
+# Project: AI and Robotics
 
-Questo progetto implementa un controller MPC combinato con CBF e AEB, e lo confronta con un controller basato su RL + AEB per la guida autonoma su Metadrive.
+This project develops a MPC controller combined with a Control Barrier Function (CBF), and compares it with a RL based controller for autonomous driving with Metadrive.
 
-**Autore:** Santiago Parra  
-**Anno:** 2026
+<video src="./src/media/video_MPC-CBF_seed_37.mp4" controls width="100%"></video>
+
+**Author:** Santiago Parra  
+**Year:** 2026
