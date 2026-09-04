@@ -79,7 +79,7 @@ def run(control_type="MPC-CBF"):
                     # Step the control in the MetaDrive Environment
                     obs, reward, terminated, truncated, info = env.step(u_action)
 
-                    # Compute errors
+                    # Compute errors and metrics
                     metrics.update(env, vehicle, state_real, u_action, info, terminated, truncated)
 
                     # Render and save video frame
@@ -108,4 +108,4 @@ def run(control_type="MPC-CBF"):
             print("=" * 115)
 
 if __name__ == "__main__":
-    run(control_type="MPC-CBF") # Change control_type between MPC_CBF and RL
+    run(control_type="RL") # Change control_type between MPC_CBF and RL

@@ -5,7 +5,7 @@
 
 This project develops a MPC controller combined with a Control Barrier Function (CBF), and compares it with a RL based controller for autonomous driving with Metadrive.
 
-<img src="src/media/mpc_cbf_demo.gif" width="400" alt="MPC-CBF Demo">
+<img src="src/media/mpc_cbf_demo.gif" width="600" alt="MPC-CBF Demo">
 
 ## MPC-CBF Controller : Formulation of the problem
 
@@ -34,7 +34,18 @@ Subject to a linear constraint $l \leq A U \leq u$ that encapsulates the CBF con
 
 ## RL Controller
 
-In addition to the MPC-CBF, we trained a PPO Controller using the $stable\_baselines3$ package. We trained the model for 250000 steps with 50 different scenarios
+- In addition to the MPC-CBF, we trained a **Proximal Policy Optimization (PPO)** controller using the `stable-baselines3` package with the Metadrive environment. 
+- We trained the model using a MLP Policy over 50 generated scenarios with traffic density of 0.15 over 250000 timesteps. 
+- The MLP receives the Metadrive observations (state of the vehicle + LiDAR measurements) and returns the chosen control (steer, acceleration) for the case.
+- The cost function for the learning process is the standard PPO cost function. We provide to PPO the  default reward function coming in `MetaDriveEnv`, which is defined as:
+
+$$ R = c_1 R_{driving} + c_2 R_{speed} + R_{terminate}$$
+
+Where $R_{driving}$ and $R_{speed}$ motivate the desired behaviour of position and speed of the vehicle respect to reference target values, respectively (similar to $J_{pos}$, $J_{speed}$ in the MPC-CBF formulation). $R_{terminate}$ contains a set of rewards: the success of the episode, penalization to crashes, etc.
+
+We consider here the default weight configuration ($c_1$, $c_2$, etc) which can be consulted in the Metadrive docs.
+
+**Note:** Here the crash constraint is given as a penalty on the reward function. This is called a soft-formulation, compared to the explicit constraint formulation given in the MPC-CBF.
 
 ## Experiments
 
