@@ -8,7 +8,7 @@ class MPC_CBF:
     def __init__(self, horizon=N):
         self.N = horizon
 
-        # Pesos cuadráticos normalizados
+        # Define quadratic weights
         self.w_pos = 0.60 / (2.0 ** 2)
         self.w_spd = 0.20 / (5.0 ** 2)
         self.w_ctrl_steer = 0.20 / (0.5 ** 2)
@@ -16,6 +16,7 @@ class MPC_CBF:
         self.w_dctrl_steer = 0.20 / (0.1 ** 2)
         self.w_dctrl_acc = 0.20 / (2.0 ** 2)
 
+    # Extract position and velocities of the nearby vehicles in a 18m radius
     def _extract_obstacles(self, env, vehicle_pos, max_dist=18.0):
         obstacles_list = []
         vehicles = env.engine.traffic_manager.vehicles
@@ -30,6 +31,7 @@ class MPC_CBF:
                     obstacles_list.append(np.array([v.position[0], v.position[1], vx, vy]))
         return obstacles_list
 
+    # Get index of a safe lane, returns None if there's no safe lane
     def _get_lane_safe(self, road_net, road_index):
         if road_index[2] < 0:
             return None
@@ -38,6 +40,8 @@ class MPC_CBF:
         except (KeyError, AttributeError, IndexError):
             return None
 
+    # Determines if the chosen lane is blocked according to the actual state and nearby vehicles position
+    # Returns True if it's blocked, returns False if not
     def _is_lane_blocked(self, lane_obj, state_real, obstacles_list):
         if lane_obj is None:
             return True
@@ -49,6 +53,7 @@ class MPC_CBF:
                 return True
         return False
 
+    # Generates a reference trajectory for the MPC using Frenet coordinate system
     def _generate_ref_trajectory(self, target_lane, state_real, should_stop):
         ref_trajectory = []
         s_ego_target, _ = target_lane.local_coordinates(state_real[:2])
@@ -63,11 +68,13 @@ class MPC_CBF:
 
         return ref_trajectory
 
+    # METADRIVE CONTROLLER: Returns the optimal action
     def get_action(self, env, state_real, u0_warm):
-        """Pipeline completo: Escaneo -> Selección de Carril -> Trayectoria -> Solución OSQP."""
+        # Extract ego vehicle and nearby obstacles
         vehicle = env.agent
         obstacles_list = self._extract_obstacles(env, vehicle.position)
 
+        # Choose a safe lane. If there are no safe lanes, activates a stop trigger
         road_net = env.engine.map_manager.current_map.road_network
         current_road = vehicle.lane_index
         current_lane = vehicle.lane
@@ -89,18 +96,24 @@ class MPC_CBF:
             else:
                 should_stop = True
 
+        # Generate the reference trajectory along the chosen lane
         ref_trajectory = self._generate_ref_trajectory(target_lane, state_real, should_stop)
 
+        # MPC CORE: Solve the MPC optimization problem
         u_nom_seq, u0_warm_flat = self.solve(
             u0_warm, state_real, ref_trajectory, obstacles_list=obstacles_list
         )
 
+        # Update the sequence of actions
         u_nom_first = u_nom_seq[0]
         u0_warm_next = np.roll(u0_warm_flat, -2)
         u0_warm_next[-2:] = u0_warm_next[-4:-2]
 
+        # Returns the optimal action, the updated base control sequence and the obstacle list
         return u_nom_first, u0_warm_next, obstacles_list
 
+    # Predicts the evolution of the system given the actual sequence of actions
+    # Returns the predicted trajectory and the Jacobians to linealize the dynamics on it
     def _predict_trajectory(self, current_state, u_seq):
         x_bar = np.zeros((self.N + 1, 4))
         x_bar[0] = current_state
@@ -115,6 +128,8 @@ class MPC_CBF:
 
         return x_bar, A_seq, B_seq
 
+    # CORE MPC SOLVER: Solve the MPC Optimization problem via LTV approach
+    # The optimization problem becomes a QP problem, solvable with OSQP
     def solve(self, u0_warm, current_state, reference_trajectory, obstacles_list=None):
         u_warm = u0_warm.reshape((self.N, 2))
         u_warm_flat = u_warm.flatten()

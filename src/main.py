@@ -36,15 +36,15 @@ def run(control_type="MPC-CBF"):
         out_of_road_done=False
     ))
 
-    # Instanciar el controlador seleccionado
+    # Initiate the chosen controller
     if control_type == "MPC-CBF":
         controller = MPC_CBF(horizon=N)
     elif control_type == "RL":
         controller = RLController("models_checkpoints/ppo_metadrive.zip")
     else:
-        raise ValueError("Selecciona un controlador válido: MPC-CBF o RL")
+        raise ValueError("Choose a valid controller: MPC-CBF, RL")
 
-    resultados = []
+    results = []
 
     try:
         for seed in range(start_seed, start_seed + num_escenarios):
@@ -60,6 +60,7 @@ def run(control_type="MPC-CBF"):
                 obstacles_list = []
 
                 for step in range(TOTAL_STEPS):
+                    # Get vehicle and it's variables
                     vehicle = env.agent
                     state_real = np.array([
                         vehicle.position[0],
@@ -68,20 +69,20 @@ def run(control_type="MPC-CBF"):
                         vehicle.heading_theta
                     ])
 
-                    # 1. Obtención de control
+                    # Execute the control
                     if control_type == "RL":
                         u_action = controller.get_action(obs, env, state_real)
                     elif control_type == "MPC-CBF":
                         if step % MPC_SKIP_STEPS == 0:
                             u_action, u0_warm, obstacles_list = controller.get_action(env, state_real, u0_warm)
 
-                    # 2. Paso en el entorno MetaDrive
+                    # Step the control in the MetaDrive Environment
                     obs, reward, terminated, truncated, info = env.step(u_action)
 
-                    # 3. Registrar métricas (actualizado a los 7 argumentos)
+                    # Compute errors
                     metrics.update(env, vehicle, state_real, u_action, info, terminated, truncated)
 
-                    # 4. Generar y guardar frame de vídeo
+                    # Render and save video frame
                     if step % VIDEO_SKIP == 0:
                         frame = render_frame(env, vehicle, state_real, control_type, step, seed, u_action, obstacles_list)
                         writer.append_data(frame)
@@ -89,7 +90,7 @@ def run(control_type="MPC-CBF"):
                     if terminated or truncated:
                         break
 
-                resultados.append(metrics.get_summary(control_type, seed))
+                results.append(metrics.get_summary(control_type, seed))
 
             finally:
                 writer.close()
@@ -98,13 +99,13 @@ def run(control_type="MPC-CBF"):
         cv2.destroyAllWindows()
         env.close()
 
-        if resultados:
+        if results:
             print("\n" + "=" * 115)
             print(f"{'MODO':<8} | {'SEMILLA':<7} | {'ÉXITO':<6} | {'ERR LAT PROM':<12} | {'EXCESO SALIDA':<14} | {'DIST MÍN':<10} | {'JERK PROM':<10} | {'STEER RATE':<10} | {'PASOS':<6}")
             print("=" * 115)
-            for r in resultados:
+            for r in results:
                 print(f"{r['Controlador']:<8} | {r['Seed']:<7} | {r['Éxito']:<6} | {r['Err. Lat. Prom (m)']:<12.3f} | {r['Exceso Salida (m)']:<14.3f} | {r['Dist. Mín Obs (m)']:<10.3f} | {r['Jerk Prom (1/s)']:<10.3f} | {r['Steer Rate Prom (rad/s)']:<10.3f} | {r['Pasos']:<6}")
             print("=" * 115)
 
 if __name__ == "__main__":
-    run(control_type="MPC-CBF")
+    run(control_type="MPC-CBF") # Change control_type between MPC_CBF and RL
