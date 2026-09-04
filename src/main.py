@@ -108,4 +108,4 @@ def run(control_type="MPC-CBF"):
             print("=" * 115)
 
 if __name__ == "__main__":
-    run(control_type="RL") # Change control_type between MPC_CBF and RL
+    run(control_type="MPC-CBF") # Change control_type between MPC-CBF and RL

@@ -47,6 +47,14 @@ We consider here the default weight configuration ($c_1$, $c_2$, etc) which can 
 
 **Note:** Here the crash constraint is given as a penalty on the reward function. This is called a soft-formulation, compared to the explicit constraint formulation given in the MPC-CBF.
 
+Additionally for the RL controller, we added a Safety Filter, in which we impose a progressive deacceleration if the vehicle reaches certain speed limit and an Emergency Braking System when approaching nearby vehicles
+
 ## Experiments
 
-For the experiments, we considered a $N = 15$, $\Delta t = 0.1$, a $\gamma = 0.2$ and the Kinematic Bycicle model, where the control is given by the acceleration and steer of the vehicle.
+For the experiments, we considered a $N = 15$, $\Delta t = 0.1$, a $\gamma = 0.2$ and the Kinematic Bycicle model, where the control is given by the acceleration and steer of the vehicle. We tested both controllers in 10 different scenarios, and we got the following metrics
+
+| Controller | Lateral Error (m) | Max Lateral Deviation (m) | Min Safety Dist (m) | Avg Jerk | Steer Rate |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **MPC-CBF** | **0.30** | **0.33** | **3.33** | **0.51** | **0.23** |
+| **RL** | 0.96 | 1.25 | 5.23 | 7.83 | 0.45 |
+
