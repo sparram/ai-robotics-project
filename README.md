@@ -5,9 +5,9 @@
 
 This project develops a MPC controller combined with a Control Barrier Function (CBF), and compares it with a RL based controller for autonomous driving with Metadrive.
 
-https://github.com/user-attachments/assets/074b175a-760f-4ef3-8d26-a1c635e1ba4f
+<img src="src/media/mpc_cbf_demo.gif" width="400" alt="MPC-CBF Demo">
 
-## Formulation of the problem
+## MPC-CBF Controller : Formulation of the problem
 
 The MPC controller is a classic controller an intuitive perspective for control driving. Given a time horizon T, the idea is to solve the following optimization problem for every time step of the simulation:
 
@@ -28,4 +28,14 @@ Which are taken for each $k = 1, 2, \dots N$ i.e for each instant of the time ho
 
 In our implementation, we perform a LTV approximation in order to transform the optimization problem into an Quadratic Programming (QP) problem. In the end we solve a system of the form:
 
-$$\min \frac{1}{2} U^T P U + q^T U$$ Subject to a linear constraint $l \leq A U \leq u$ that encapsulates the CBF constraint and the physical limit of the control
+$$\min \frac{1}{2} U^T P U + q^T U$$ 
+
+Subject to a linear constraint $l \leq A U \leq u$ that encapsulates the CBF constraint and the physical limit of the control.
+
+## RL Controller
+
+In addition to the MPC-CBF, we trained a PPO Controller using the $stable\_baselines3$ package. We trained the model for 250000 steps with 50 different scenarios
+
+## Experiments
+
+For the experiments, we considered a $N = 15$, $\Delta t = 0.1$, a $\gamma = 0.2$ and the Kinematic Bycicle model, where the control is given by the acceleration and steer of the vehicle.
